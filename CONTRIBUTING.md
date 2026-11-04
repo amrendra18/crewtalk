@@ -59,7 +59,7 @@ Run the full checks before each pull request:
 ```
 
 It runs the quick checks, then one `scripts/verify fast` run, which must prove every
-journey except `codex-rule`, which it must report as skipped:
+journey except `codex-rule` and `crew-one-worker`, which it must report as skipped:
 
 1. In `claude-claude`, two `crewtalk wait` processes stand in for Claude sessions and exchange
    one message each way. No Claude session takes part.
@@ -74,10 +74,16 @@ journey except `codex-rule`, which it must report as skipped:
    reply must use `--reply-to` and keep its own thread at turn 2.
 6. In `claude-codex` and `codex-claude`, a `crewtalk wait` listener and a Codex session make one
    round trip.
+7. In `crew-fake-round`, `crew start` runs a worker with a fake `herdr` and a fake worker
+   (`cmd/crew/testdata/`). The worker's reply must reach a `crewtalk wait` listener at turn 2, and
+   `crew stop` must close its pane and remove its names, folder and branch.
+8. In `crew-dirty-stop`, `crew stop` runs on a worktree with a changed, an untracked and an ignored
+   file. All three, the folder and the branch must stay.
 
-The first four journeys need no settings. Each uses its own temporary `CREWTALK_HOME`. So
-`scripts/verify fast` run alone with no thread settings proves those 4, skips `two-projects`,
-`claude-codex`, `codex-claude` and `codex-rule`, and exits 0.
+The first four journeys and the two `crew-` journeys above need no settings. Each uses its own
+temporary `CREWTALK_HOME`. So `scripts/verify fast` run alone with no thread settings proves those
+6, skips `two-projects`, `claude-codex`, `codex-claude`, `codex-rule` and `crew-one-worker`, and
+exits 0.
 
 `two-projects` and the round trip use a test input: the fake codex
 `internal/route/codex/testdata/codex` runs the reply command in place of `codex`, with a temporary
@@ -86,7 +92,7 @@ For this run only, `scripts/verify` builds `crewtalk` with `-tags crewtalk_test`
 build that reads `CREWTALK_CODEX_BIN`.
 A `codex queue` call must take under 1.9 seconds, measured by `claude-codex`. Each delivery on the
 Claude route must take under 0.1 seconds, measured by `claude-claude`, `by-name`, `limits` and
-`codex-claude`. `held` and `two-projects` measure no bar.
+`codex-claude`. `held`, `two-projects` and the `crew-` journeys measure no bar.
 Then more test inputs must make journeys fail or be refused:
 
 1. The same fake in its unknown-thread mode must make `claude-codex` fail.
@@ -103,6 +109,14 @@ Then more test inputs must make journeys fail or be refused:
    `codex-rule` fail.
 9. A stand-in `codex` that allows `PATH=/x crewtalk send`, then one that allows
    `CREWTALK_HOME=/x crewtalk send`, must make `codex-rule` fail.
+10. A fake worker that never sends its ready message, then one that never replies, must make
+    `crew-fake-round` fail. These are `FAKE_WORKER_MODE=no-ready` and `FAKE_WORKER_MODE=no-reply`.
+11. A fake `herdr` that answers every `agent start` with `agent_pane_busy` must make
+    `crew-fake-round` fail with exit 5, and no agent may start.
+12. A fake `herdr` with `pane close` taken off its allowed list must make `crew-fake-round` fail.
+13. A stand-in `git` that reports a clean status and removes the folder must make `crew-dirty-stop`
+    fail, which shows that the journey sees a lost file.
+14. `scripts/verify full` without `CREW_VERIFY_MODEL` must skip `crew-one-worker` and exit 1.
 
 One more test input must work: a stand-in `codex` that allows only `crewtalk send` must get
 `codex-rule` proven.
@@ -112,19 +126,22 @@ Codex, Claude or herdr session is contacted. This check therefore does not prove
 sessions.
 Both `./scripts/check` modes and `scripts/verify` unset `HERDR_ENV`, so no run shows you a
 notice.
-Each `./scripts/check full` run adds twelve evidence folders under `.local/verify/`.
+Each `./scripts/check full` run adds eighteen evidence folders under `.local/verify/`.
 Each folder's `summary.json` names the commit it built (`commit`), whether a file differed
 from that commit (`dirty`), and the sha256 of the `crewtalk` it built (`binary_sha256`).
 `dirty` is true for a tracked change and for an untracked file that `.gitignore` does not
 ignore.
 
 The live check is `scripts/verify full`. Two Codex sessions must be open. Each gets a request and
-runs a reply command. Each session's `CODEX_THREAD_ID` holds its thread id. From the root of your
-clone, with those two different ids in place of `THREAD_UUID_1` and `THREAD_UUID_2`, run:
+runs a reply command. Each session's `CODEX_THREAD_ID` holds its thread id. Run it inside herdr,
+because `crew-one-worker` opens a real Codex worker in a new tab of your workspace. That journey
+spends model quota, so set `CREW_VERIFY_MODEL` to a low-cost model. Trust this repository in Codex
+once first, or the worker stops at a dialog. From the root of your clone, with those two different
+ids in place of `THREAD_UUID_1` and `THREAD_UUID_2`, run:
 
 ```sh
 CREWTALK_VERIFY_CODEX_THREAD=THREAD_UUID_1 CREWTALK_VERIFY_CODEX_THREAD_2=THREAD_UUID_2 \
-  scripts/verify full
+  CREW_VERIFY_MODEL=MODEL scripts/verify full
 ```
 
 It runs every journey, and a journey skipped for a missing setting makes it exit 1. It refuses
@@ -136,6 +153,13 @@ Its `codex-rule` step runs the real `codex execpolicy check` against
 `~/.codex/rules/default.rules`. `crewtalk send` must get the decision `allow`. `herdr agent
 prompt`, `PATH=/x crewtalk send` and `CREWTALK_HOME=/x crewtalk send` must not.
 `scripts/verify fast` reports this step as skipped and does not fail.
+
+`crew-one-worker` starts one real Codex worker through `crew`, in a worktree under `CREW_HOME`
+(default `~/.crew`). The worker replies, and `crew stop` closes it. The journey adds one untracked
+file to that worktree first. The file and the folder must stay, and the journey then removes them
+and the branch itself. Its row stays in `CREW_HOME/workers.json`, because rows are never deleted.
+It runs the `crewtalk` on your PATH on both sides, and does not compare it with the build under
+test. `verify/features/crew-one-worker.md` holds the details.
 
 The `claude-codex` and `codex-claude` journeys of `scripts/verify full` prove that a real Codex
 session gets the request and runs the reply. Every journey still listens with `crewtalk wait` in

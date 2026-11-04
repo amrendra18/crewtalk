@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-journeys="claude-claude by-name held limits two-projects claude-codex codex-claude codex-rule"
+journeys="claude-claude by-name held limits two-projects claude-codex codex-claude codex-rule crew-fake-round crew-dirty-stop crew-one-worker"
 codex_bar=1.9
 claude_bar=0.1
 
@@ -9,7 +9,7 @@ usage() {
   cat <<EOF
 usage: scripts/verify fast|full [--feature NAME]
 
-Proves crewtalk delivery between agent sessions. verify/features/ maps each
+Proves crewtalk delivery between agent sessions, and crew's round with a worker. verify/features/ maps each
 journey to its use case. In every journey, crewtalk wait processes stand in
 for Claude sessions.
   claude-claude  two crewtalk wait processes exchange one message each way
@@ -35,8 +35,17 @@ for Claude sessions.
                  ~/.codex/rules/default.rules must allow crewtalk send and
                  must not allow herdr agent prompt, PATH=/x crewtalk send or
                  CREWTALK_HOME=/x crewtalk send; fast reports it skipped
-claude-claude, by-name, held and limits need no settings and contact no
-session; each uses its own temporary CREWTALK_HOME.
+  crew-fake-round  crew start with a fake herdr and a fake worker: the worker
+                 gets its task, its reply reaches the lead at turn 2, and
+                 crew stop closes the pane, the names, the folder and the branch
+  crew-dirty-stop  crew stop on a worktree with a changed, an untracked and an
+                 ignored file keeps all three, the folder and the branch
+  crew-one-worker  full only: the same round as crew-fake-round on a real
+                 Codex worker in real herdr, with a file kept by crew stop;
+                 run it inside herdr with CREW_VERIFY_MODEL set; fast reports
+                 it skipped
+claude-claude, by-name, held, limits, crew-fake-round and crew-dirty-stop need
+no settings and contact no session; each uses its own temporary CREWTALK_HOME.
 One round trip proves both claude-codex and codex-claude.
 Only the live journeys prove two things. scripts/verify full proves that a
 real Codex session gets the request and runs the reply. A journey by hand
@@ -55,9 +64,10 @@ measures it. held and two-projects measure no bar:
   full   the live check: the same, but a skipped journey fails the run, and
          a stand-in (CREWTALK_CODEX_BIN) is refused as a usage error
   --feature NAME   run one journey only: claude-claude, by-name, held,
-                   limits, two-projects, claude-codex, codex-claude or
-                   codex-rule; the run fails unless that journey is proven,
-                   also in fast, except codex-rule, which fast skips
+                   limits, two-projects, claude-codex, codex-claude, codex-rule,
+                   crew-fake-round, crew-dirty-stop or crew-one-worker; the run
+                   fails unless that journey is proven, also in fast, except
+                   codex-rule and crew-one-worker, which fast skips
 
 Settings:
   CREWTALK_VERIFY_CODEX_THREAD  UUID of a live Codex thread that will run the
@@ -81,10 +91,23 @@ Settings:
                                 claude-codex and codex-claude (default
                                 ~/.crewtalk); the Codex sessions must use the
                                 same folder
+  CREW_VERIFY_MODEL             the Codex model for crew-one-worker; unset,
+                                that journey is skipped
+  CREW_VERIFY_EFFORT            its effort (default medium)
+  CREW_HOME                     crew's state folder for crew-one-worker
+                                (default ~/.crew)
+  CREW_START_WAIT               the wait for a worker's ready message; the fake
+                                journeys default to 30s
+  Test inputs for the fake journeys:
+  FAKE_WORKER_MODE              no-ready: the fake worker never sends ready;
+                                no-reply: it never answers its task
+  FAKE_HERDR_START              always-busy: every agent start is refused
+  FAKE_HERDR_DENY               a herdr command the fake refuses, such as
+                                "pane close"
 
 Exit codes: 0 every selected journey proven (in fast without --feature, a
 skipped journey also counts, and fast --feature codex-rule reports codex-rule
-skipped and exits 0), 1 a journey failed or was not proven, 3 a
+skipped and exits 0, and so does fast --feature crew-one-worker), 1 a journey failed or was not proven, 3 a
 needed tool is missing or the crewtalk on PATH is not the build under test,
 and nothing was sent, 64 usage error.
 
@@ -237,7 +260,7 @@ finish() {
     st=$(state_of "$j")
     reason=$(reason_of "$j")
     case $st:$mode:$feature in
-      proven:* | skipped:fast: | skipped:fast:codex-rule) ;;
+      proven:* | skipped:fast: | skipped:fast:codex-rule | skipped:fast:crew-one-worker) ;;
       *) [ "$code" -ne 0 ] || code=1 ;;
     esac
     line="$j: $st"
@@ -670,7 +693,271 @@ $reply_cmd"
   fi
 }
 
+# A round with crew. The fake journeys run a crewtalk built with the test tag, a
+# fake herdr and a fake worker, all first on PATH, in folders under the run's
+# temporary folder.
+fake_thread=11111111-2222-4333-8444-555555555555
+
+in_fake() {
+  local at=$1 silent=
+  shift
+  [ "${FAKE_WORKER_MODE:-}" != no-reply ] || silent=$fake_thread
+  env PATH="$fake_bin:$PATH" CREW_HOME="$at/crew" CREWTALK_HOME="$at/talk" \
+    CREW_START_WAIT="${CREW_START_WAIT:-30s}" HERDR_ENV=1 HERDR_WORKSPACE_ID=verify \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    FAKE_HERDR_STATE="$at/herdr" FAKE_WORKER_BIN="$PWD/cmd/crew/testdata/worker" \
+    CREWTALK_CODEX_BIN="$PWD/internal/route/codex/testdata/codex" FAKE_CODEX_MODE=reply \
+    FAKE_CODEX_RUNS=/dev/null FAKE_CODEX_ARGS=/dev/null FAKE_CODEX_SILENT_THREAD="$silent" \
+    FAKE_WORKER_THREAD="$fake_thread" "$@"
+}
+
+crew_fixture() {
+  local at=$1 log=$2
+  mkdir -p "$at/repo/ignored" || return 1
+  printf 'ignored/\n' >"$at/repo/.gitignore"
+  printf 'first\n' >"$at/repo/tracked.txt"
+  in_fake "$at" git -C "$at/repo" init -q -b main >>"$log" 2>&1 &&
+    in_fake "$at" git -C "$at/repo" add .gitignore tracked.txt >>"$log" 2>&1 &&
+    in_fake "$at" git -C "$at/repo" -c user.name=verify -c user.email=verify@example.invalid \
+      -c commit.gpgsign=false commit -q -m first >>"$log" 2>&1
+}
+
+line_count() { if [ -f "$1" ]; then grep -c . "$1"; else echo 0; fi; }
+
+crew_listener_left() { pgrep -f "crewtalk wait --as ($1|crew-ready-${1##*-})( |\$)" >/dev/null; }
+
+crew_fake_start() {
+  local journey=$1 at=$2 lead=$3 code started
+  crew_out=$(in_fake "$at" crew start --lead "$lead" --role review --deadline 10m --folder "$at/repo" \
+    --task "Read the plan." 2>"$logs/$journey-start.err")
+  code=$?
+  started=$(line_count "$at/herdr/started")
+  echo "crew start exit $code, agents started $started: $crew_out" >>"$logs/$journey.log"
+  [ ! -f "$at/herdr/calls" ] || tr '\0' ' ' <"$at/herdr/calls" >"$logs/$journey-herdr-calls.txt"
+  if [ "$code" -ne 0 ]; then
+    why="crew start exited $code, agents started $started: $(first_line "$logs/$journey-start.err")"
+    return 1
+  fi
+  if ! crew_id=$(field "$crew_out" id); then
+    why="crew start printed no id: $crew_out"
+    return 1
+  fi
+}
+
+crew_fake_round() {
+  local at=$build/cfr lead=$listener-lead pid code task_id header stop_out left
+  crew_fixture "$at" "$logs/crew-fake-round.log" || { record crew-fake-round failed "the test repository could not be made: $(first_line "$logs/crew-fake-round.log")"; return; }
+  listen "$lead" "$at/talk" "$logs/crew-fake-round-lead.txt" "$logs/crew-fake-round-lead.err" || { record crew-fake-round failed "$why"; return; }
+  pid=$waiter
+  crew_fake_start crew-fake-round "$at" "$lead" || { record crew-fake-round failed "$why"; return; }
+  task_id=$(field "$crew_out" task_id) || { record crew-fake-round failed "crew start printed no task id: $crew_out"; return; }
+  reap "$pid" "$timeout"
+  code=$?
+  if [ "$code" -ne 0 ]; then
+    record crew-fake-round failed "no reply from $crew_id within $timeout s (crewtalk wait exit $code)"
+    return
+  fi
+  header=$(head -n 1 "$logs/crew-fake-round-lead.txt")
+  case $header in
+    "[crewtalk from codex:$fake_thread to claude:$lead, thread $task_id, turn 2, reply-to $task_id, id "*) ;;
+    *) record crew-fake-round failed "the reply does not carry thread $task_id, turn 2 and reply-to $task_id: $header"; return ;;
+  esac
+  stop_out=$(in_fake "$at" crew stop "$crew_id" 2>"$logs/crew-fake-round-stop.err")
+  code=$?
+  echo "crew stop exit $code: $stop_out" >>"$logs/crew-fake-round.log"
+  [ ! -f "$at/herdr/calls" ] || tr '\0' ' ' <"$at/herdr/calls" >"$logs/crew-fake-round-herdr-calls.txt"
+  if [ "$code" -ne 0 ]; then
+    record crew-fake-round failed "crew stop exited $code: $(first_line "$logs/crew-fake-round-stop.err")"
+    return
+  fi
+  if [ -e "$at/crew/worktrees/$crew_id" ]; then
+    record crew-fake-round failed "the clean folder of $crew_id stayed"
+    return
+  fi
+  if in_fake "$at" git -C "$at/repo" rev-parse --verify --quiet "refs/heads/crew/$crew_id" >/dev/null; then
+    record crew-fake-round failed "the branch crew/$crew_id stayed"
+    return
+  fi
+  left=$(find "$at/herdr/panes" -type f | wc -l | tr -d ' ')
+  if [ "$left" -ne 0 ]; then
+    record crew-fake-round failed "$left panes stayed open"
+    return
+  fi
+  if in_fake "$at" crewtalk who | grep -qE "^($crew_id|crew-ready-)"; then
+    record crew-fake-round failed "a worker name stayed in the address book"
+    return
+  fi
+  if crew_listener_left "$crew_id"; then
+    record crew-fake-round failed "a crewtalk wait for $crew_id still runs"
+    return
+  fi
+  grep -q '"state": "stopped"' "$at/crew/workers.json" || { record crew-fake-round failed "the row of $crew_id does not read stopped"; return; }
+  record crew-fake-round proven "$crew_id started, tasked, replied at turn 2 and stopped; agents started $(line_count "$at/herdr/started"), 0 panes, 0 names and 0 listeners left"
+}
+
+crew_dirty_stop() {
+  local at=$build/cds lead=$listener-lead code folder stop_out kept
+  crew_fixture "$at" "$logs/crew-dirty-stop.log" || { record crew-dirty-stop failed "the test repository could not be made: $(first_line "$logs/crew-dirty-stop.log")"; return; }
+  joined+=$at/talk/$lead$'\n'
+  if ! in_fake "$at" crewtalk join --as "$lead" --kind claude >>"$logs/crew-dirty-stop.log" 2>&1; then
+    record crew-dirty-stop failed "crewtalk join --as $lead failed: $(first_line "$logs/crew-dirty-stop.log")"
+    return
+  fi
+  crew_fake_start crew-dirty-stop "$at" "$lead" || { record crew-dirty-stop failed "$why"; return; }
+  folder=$at/crew/worktrees/$crew_id
+  printf 'changed\n' >"$folder/tracked.txt"
+  printf 'untracked\n' >"$folder/untracked.txt"
+  mkdir -p "$folder/ignored"
+  printf 'ignored\n' >"$folder/ignored/notes.txt"
+  stop_out=$(in_fake "$at" crew stop "$crew_id" 2>"$logs/crew-dirty-stop-stop.err")
+  code=$?
+  echo "crew stop exit $code: $stop_out" >>"$logs/crew-dirty-stop.log"
+  cat "$logs/crew-dirty-stop-stop.err" >>"$logs/crew-dirty-stop.log"
+  if [ "$code" -ne 0 ]; then
+    record crew-dirty-stop failed "crew stop exited $code: $(first_line "$logs/crew-dirty-stop-stop.err")"
+    return
+  fi
+  for kept in "tracked.txt:changed" "untracked.txt:untracked" "ignored/notes.txt:ignored"; do
+    if [ "$(cat "$folder/${kept%%:*}" 2>/dev/null)" != "${kept##*:}" ]; then
+      record crew-dirty-stop failed "crew stop lost ${kept%%:*}"
+      return
+    fi
+  done
+  if ! in_fake "$at" git -C "$at/repo" rev-parse --verify --quiet "refs/heads/crew/$crew_id" >/dev/null; then
+    record crew-dirty-stop failed "the branch crew/$crew_id was deleted with a kept folder"
+    return
+  fi
+  if [ "$(field "$stop_out" kept_paths)" != 3 ] || ! grep -qF "$folder" "$logs/crew-dirty-stop-stop.err"; then
+    record crew-dirty-stop failed "crew stop did not print the path and 3 kept paths: $stop_out"
+    return
+  fi
+  if [ "$(find "$at/herdr/panes" -type f | wc -l | tr -d ' ')" -ne 0 ]; then
+    record crew-dirty-stop failed "the pane stayed open"
+    return
+  fi
+  if in_fake "$at" crewtalk who | grep -q "^$crew_id "; then
+    record crew-dirty-stop failed "the name $crew_id stayed in the address book"
+    return
+  fi
+  record crew-dirty-stop proven "the pane closed and the name went; 0 of 3 files lost, and the folder and the branch stayed"
+}
+
+# The real round. It runs the crewtalk on PATH on both sides, because that is the
+# one the real worker runs, and it leaves crewtalk itself out of the test.
+crew_real() { PATH=$real_path "$build/crew" "$@"; }
+
+crew_real_cleanup() {
+  [ -n "$crew_open" ] || return 0
+  rm -f "${crew_open_folder:?}/verify-keep.txt"
+  crew_real stop "$crew_open" --force >>"$logs/crew-one-worker.log" 2>&1
+  echo "cleanup of $crew_open: crew stop --force exit $?" >>"$logs/crew-one-worker.log"
+  crew_open=
+}
+
+crew_one_worker() {
+  local bin lead=$listener-lead pid code marker out task_id header before after branch pane pane_out tries=0
+  bin=$(PATH=$real_path command -v crewtalk)
+  before=$(git status --porcelain)
+  listen "$lead" "$home" "$logs/crew-one-worker-lead.txt" "$logs/crew-one-worker-lead.err" || { record crew-one-worker failed "$why"; return; }
+  pid=$waiter
+  marker=$(new_marker)
+  out=$(crew_real start --lead "$lead" --role verify --deadline 15m --folder "$PWD" \
+    --model "$CREW_VERIFY_MODEL" --effort "${CREW_VERIFY_EFFORT:-medium}" \
+    --task "This is a harness check from scripts/verify. Run no command except the reply. Your result is the word $marker" \
+    2>"$logs/crew-one-worker-start.err")
+  code=$?
+  echo "crew start exit $code: $out" >>"$logs/crew-one-worker.log"
+  crew_id=$(field "$out" id) || crew_id=
+  crew_open=$crew_id
+  crew_open_folder=$(field "$out" folder) || crew_open_folder=
+  if [ "$code" -ne 0 ]; then
+    record crew-one-worker failed "crew start exited $code: $(first_line "$logs/crew-one-worker-start.err")"
+    return
+  fi
+  task_id=$(field "$out" task_id)
+  pane=$(field "$out" pane)
+  reap "$pid" $((timeout + 10))
+  code=$?
+  if [ "$code" -ne 0 ] || ! grep -qF "$marker" "$logs/crew-one-worker-lead.txt"; then
+    record crew-one-worker failed "no reply with the marker from $crew_id within $timeout s (crewtalk wait exit $code)"
+    return
+  fi
+  header=$(head -n 1 "$logs/crew-one-worker-lead.txt")
+  case $header in
+    "[crewtalk from codex:"*" to claude:$lead, thread $task_id, turn 2, reply-to $task_id, id "*) ;;
+    *) record crew-one-worker failed "the reply does not carry thread $task_id, turn 2 and reply-to $task_id: $header"; return ;;
+  esac
+  printf 'keep\n' >"$crew_open_folder/verify-keep.txt"
+  until out=$(crew_real stop "$crew_id" 2>"$logs/crew-one-worker-stop.err"); do
+    code=$?
+    if [ "$code" -ne 5 ] || [ $((tries += 1)) -gt 30 ]; then
+      record crew-one-worker failed "crew stop exited $code: $(first_line "$logs/crew-one-worker-stop.err")"
+      return
+    fi
+    sleep 2
+  done
+  echo "crew stop: $out" >>"$logs/crew-one-worker.log"
+  cat "$logs/crew-one-worker-stop.err" >>"$logs/crew-one-worker.log"
+  if [ "$(cat "$crew_open_folder/verify-keep.txt" 2>/dev/null)" != keep ]; then
+    record crew-one-worker failed "crew stop lost the kept file"
+    return
+  fi
+  if [ "$(field "$out" folder_kept)" != 1 ]; then
+    record crew-one-worker failed "crew stop did not report the kept folder: $out"
+    return
+  fi
+  pane_out=$(PATH=$real_path herdr pane get "$pane" 2>&1)
+  case $pane_out in
+    *'"pane_not_found"'*) ;;
+    *) record crew-one-worker failed "pane $pane did not close: $pane_out"; return ;;
+  esac
+  if PATH=$real_path "$bin" who | grep -qE "^($crew_id|crew-ready-${crew_id##*-}) "; then
+    record crew-one-worker failed "a worker name stayed in the address book"
+    return
+  fi
+  if crew_listener_left "$crew_id"; then
+    record crew-one-worker failed "a crewtalk wait for $crew_id still runs"
+    return
+  fi
+  rm -f "$crew_open_folder/verify-keep.txt"
+  branch=crew/$crew_id
+  if [ -n "$(git -C "$crew_open_folder" status --porcelain --ignored --untracked-files=normal --ignore-submodules=none)" ] ||
+    ! git worktree remove "$crew_open_folder" >>"$logs/crew-one-worker.log" 2>&1 ||
+    ! git branch -q -d "$branch" >>"$logs/crew-one-worker.log" 2>&1; then
+    record crew-one-worker failed "the folder or branch of $crew_id could not be removed after the check"
+    crew_open=
+    return
+  fi
+  crew_open=
+  after=$(git status --porcelain)
+  if [ "$before" != "$after" ]; then
+    record crew-one-worker failed "the checkout's git status changed during the journey"
+    return
+  fi
+  record crew-one-worker proven "real Codex worker $crew_id started, tasked, replied at turn 2 and stopped; pane $pane closed, 0 files lost, 0 names and 0 listeners left"
+}
+
 record_set "$selected" failed "not run"
+crew_open=
+crew_open_folder=
+crew_live=
+fake_journeys=
+for j in $selected; do
+  case $j in
+    crew-fake-round | crew-dirty-stop) fake_journeys=yes ;;
+    crew-one-worker)
+      if [ "$mode" = fast ]; then
+        record crew-one-worker skipped "scripts/verify full only"
+      elif [ -z "${CREW_VERIFY_MODEL:-}" ]; then
+        record crew-one-worker skipped "CREW_VERIFY_MODEL is not set"
+      elif [ -z "${HERDR_WORKSPACE_ID:-}" ]; then
+        record crew-one-worker skipped "HERDR_WORKSPACE_ID is not set; run it inside herdr"
+      else
+        crew_live=yes
+      fi
+      ;;
+  esac
+done
 codex_run=
 two_run=
 rule_run=
@@ -697,7 +984,7 @@ replies_run=$codex_run$two_run
 
 codex=${CREWTALK_CODEX_BIN:-codex}
 codex_used=$replies_run$rule_run
-for tool in go perl shasum ${codex_used:+"$codex"}; do
+for tool in go perl shasum ${codex_used:+"$codex"} ${crew_live:+codex herdr crewtalk}; do
   command -v "$tool" >/dev/null || {
     record_set "$selected" skipped "doctor: $tool not found"
     finish 3
@@ -710,7 +997,9 @@ if [ -n "$replies_run" ] && [ -z "${CREWTALK_CODEX_BIN:-}" ] && ! command -v cre
 fi
 
 build=$(mktemp -d /tmp/crewtalk-verify.XXXXXX) || exit 3
-trap '[ -z "${waiters// /}" ] || { kill $waiters; wait $waiters; } 2>/dev/null
+real_path=$PATH
+trap 'crew_real_cleanup
+[ -z "${waiters// /}" ] || { kill $waiters; wait $waiters; } 2>/dev/null
 while IFS= read -r entry; do
   [ -z "$entry" ] || CREWTALK_HOME=${entry%/*} "$bin" leave --as "${entry##*/}" >>"$logs/leave.log" 2>&1
 done <<<"$joined"
@@ -721,6 +1010,19 @@ if ! go build -tags "$tags" -o "$bin" ./cmd/crewtalk >"$logs/build.log" 2>&1; th
   finish
 fi
 binary_sha256=$(sha256 "$bin")
+
+if [ -n "$fake_journeys$crew_live" ] && ! go build -o "$build/crew" ./cmd/crew >>"$logs/build.log" 2>&1; then
+  record_set "$selected" failed "go build ./cmd/crew failed: $(first_line "$logs/build.log"); see $logs/build.log"
+  finish
+fi
+fake_bin=$build/crew-fake
+if [ -n "$fake_journeys" ]; then
+  mkdir "$fake_bin" && ln -s "$build/crew" "$fake_bin/crew" && ln -s "$PWD/cmd/crew/testdata/herdr" "$fake_bin/herdr"
+  if ! go build -tags crewtalk_test -o "$fake_bin/crewtalk" ./cmd/crewtalk >>"$logs/build.log" 2>&1; then
+    record_set "$selected" failed "go build of the test crewtalk failed: $(first_line "$logs/build.log"); see $logs/build.log"
+    finish
+  fi
+fi
 
 if [ -n "$replies_run" ] && [ -z "${CREWTALK_CODEX_BIN:-}" ]; then
   installed=$(command -v crewtalk)
@@ -740,6 +1042,14 @@ for j in $selected; do
     limits) limits ;;
     two-projects) [ -z "$two_run" ] || two_projects ;;
     codex-rule) [ -z "$rule_run" ] || codex_rule ;;
+    crew-fake-round) crew_fake_round ;;
+    crew-dirty-stop) crew_dirty_stop ;;
+    crew-one-worker)
+      if [ -n "$crew_live" ]; then
+        crew_one_worker
+        crew_real_cleanup
+      fi
+      ;;
   esac
 done
 [ -z "$codex_run" ] || round_trip

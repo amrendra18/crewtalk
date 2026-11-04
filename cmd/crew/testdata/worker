@@ -1,0 +1,15 @@
+#!/bin/sh
+# Stands in for a Codex session's first turn: it runs the ready command that its
+# first prompt names. Later messages reach the fake codex through crewtalk's route.
+[ "${FAKE_WORKER_MODE:-reply}" != no-ready ] || exit 0
+to=$(printf '%s\n' "$1" | sed -n 's/.*The command: crewtalk send --to \([^ ]*\) "\([^"]*\)".*/\1/p')
+word=$(printf '%s\n' "$1" | sed -n 's/.*The command: crewtalk send --to \([^ ]*\) "\([^"]*\)".*/\2/p')
+[ -n "$to" ] && [ -n "$word" ] || {
+	echo "fake worker: the first prompt names no ready command" >&2
+	exit 1
+}
+if [ "${FAKE_WORKER_MODE:-reply}" = wrong-sender ]; then
+	crewtalk send --from claude:someone-else --to "$to" "$word"
+	exit
+fi
+CODEX_THREAD_ID=${FAKE_WORKER_THREAD:-11111111-2222-4333-8444-555555555555} crewtalk send --to "$to" "$word"
