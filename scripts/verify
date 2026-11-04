@@ -1,0 +1,746 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+journeys="claude-claude by-name held limits two-projects claude-codex codex-claude codex-rule"
+codex_bar=1.9
+claude_bar=0.1
+
+usage() {
+  cat <<EOF
+usage: scripts/verify fast|full [--feature NAME]
+
+Proves crewtalk delivery between agent sessions. verify/features/ maps each
+journey to its use case. In every journey, crewtalk wait processes stand in
+for Claude sessions.
+  claude-claude  two crewtalk wait processes exchange one message each way
+                 through crewtalk send, with no Codex or Claude session, in a
+                 temporary CREWTALK_HOME
+  by-name        the same, but each side sends by its joined name, and the
+                 answer uses --reply-to; the reply must carry the thread,
+                 turn 2 and the reply-to id
+  held           a send to a joined Claude name with no listener is held
+                 (exit 0), and the next crewtalk wait for that name prints it
+  limits         six turns in one thread are delivered, the seventh is
+                 refused with exit 3, and a send while PAUSE exists is
+                 refused with exit 3
+  two-projects   a lead crewtalk wait listener sends one instruction by joined
+                 name to each of two Codex threads, and restarts its wait
+                 after each message; each reply uses --reply-to and must keep
+                 its own thread at turn 2
+  claude-codex   crewtalk send queues a request on the Codex thread
+                 CREWTALK_VERIFY_CODEX_THREAD, asking it to reply
+  codex-claude   that Codex session runs the reply command, and the
+                 harness's own crewtalk wait listener receives the marker
+  codex-rule     full only: the real codex execpolicy check against
+                 ~/.codex/rules/default.rules must allow crewtalk send and
+                 must not allow herdr agent prompt, PATH=/x crewtalk send or
+                 CREWTALK_HOME=/x crewtalk send; fast reports it skipped
+claude-claude, by-name, held and limits need no settings and contact no
+session; each uses its own temporary CREWTALK_HOME.
+One round trip proves both claude-codex and codex-claude.
+Only the live journeys prove two things. scripts/verify full proves that a
+real Codex session gets the request and runs the reply. A journey by hand
+with real Claude Code sessions proves that the end of crewtalk wait wakes the
+session. No script proves that.
+
+Delivery bars, without model time. A missed bar fails the journey that
+measures it. held and two-projects measure no bar:
+  the codex queue call (the request's crewtalk send) under $codex_bar s,
+  measured by claude-codex
+  each Claude route delivery under $claude_bar s, from the time in the message
+  id to the moment the listener prints the message, measured by claude-claude,
+  by-name, limits and codex-claude
+
+  fast   run the selected journeys; a journey without its settings is skipped
+  full   the live check: the same, but a skipped journey fails the run, and
+         a stand-in (CREWTALK_CODEX_BIN) is refused as a usage error
+  --feature NAME   run one journey only: claude-claude, by-name, held,
+                   limits, two-projects, claude-codex, codex-claude or
+                   codex-rule; the run fails unless that journey is proven,
+                   also in fast, except codex-rule, which fast skips
+
+Settings:
+  CREWTALK_VERIFY_CODEX_THREAD  UUID of a live Codex thread that will run the
+                                reply command; unset, two-projects,
+                                claude-codex and codex-claude are skipped
+  CREWTALK_VERIFY_CODEX_THREAD_2
+                                UUID of a second live Codex thread, different
+                                from the first; unset, two-projects is skipped
+  CREWTALK_VERIFY_TIMEOUT       seconds to wait for each reply (default 300)
+  CREWTALK_CODEX_BIN            a stand-in for codex, fast only; the run then
+                                builds crewtalk with -tags crewtalk_test, the
+                                only build that reads this variable, and
+                                records the stand-in. Unset, the crewtalk on
+                                PATH, which the Codex session runs for the
+                                reply, must be byte-identical to the build
+                                under test
+  CREWTALK_VERIFY_CLAUDE_BAR    a test input, honoured only with
+                                CREWTALK_CODEX_BIN: the Claude route bar in
+                                seconds, in place of 0.1
+  CREWTALK_HOME                 crewtalk state folder for two-projects,
+                                claude-codex and codex-claude (default
+                                ~/.crewtalk); the Codex sessions must use the
+                                same folder
+
+Exit codes: 0 every selected journey proven (in fast without --feature, a
+skipped journey also counts, and fast --feature codex-rule reports codex-rule
+skipped and exits 0), 1 a journey failed or was not proven, 3 a
+needed tool is missing or the crewtalk on PATH is not the build under test,
+and nothing was sent, 64 usage error.
+
+Each run writes .local/verify/<UTC time>/ with summary.json, summary.md and
+logs/. The summary names the commit (git rev-parse HEAD), whether a file
+differs from it (dirty: a tracked change, or an untracked file that is not
+ignored), and the sha256 of the crewtalk built for the run. That build goes to a temporary folder under /tmp, deleted at the end.
+On exit, the run stops every crewtalk wait it started and lists their
+process ids in logs/listeners.pid. It calls crewtalk leave for every name it
+joined, so it leaves no row in the address book. The run unsets HERDR_ENV,
+so crewtalk shows no operator notice while it runs.
+The last line printed is "verify MODE: exit CODE, evidence FOLDER".
+EOF
+}
+
+usage_error() {
+  usage >&2
+  echo "verify: $1" >&2
+  echo "verify usage: exit 64" >&2
+  exit 64
+}
+
+mode=
+feature=
+while [ $# -gt 0 ]; do
+  case $1 in
+    -h | --help) usage; exit 0 ;;
+    fast | full) [ -z "$mode" ] || usage_error "more than one mode"; mode=$1 ;;
+    --feature) [ $# -ge 2 ] || usage_error "--feature needs a name"; feature=$2; shift ;;
+    *) usage_error "unknown argument: $1" ;;
+  esac
+  shift
+done
+[ -n "$mode" ] || usage_error "missing mode"
+if [ "$mode" = full ] && [ -n "${CREWTALK_CODEX_BIN:-}" ]; then
+  usage_error "full is the live check and needs the real codex; unset CREWTALK_CODEX_BIN"
+fi
+selected=$journeys
+if [ -n "$feature" ]; then
+  case " $journeys " in
+    *" $feature "*) selected=$feature ;;
+    *) usage_error "unknown feature: $feature (known: $journeys)" ;;
+  esac
+fi
+timeout=${CREWTALK_VERIFY_TIMEOUT:-300}
+case $timeout in
+  '' | *[!0-9]* | 0) usage_error "CREWTALK_VERIFY_TIMEOUT must be a whole number of seconds above 0" ;;
+esac
+if [ -n "${CREWTALK_VERIFY_CLAUDE_BAR:-}" ]; then
+  [ -n "${CREWTALK_CODEX_BIN:-}" ] || usage_error "CREWTALK_VERIFY_CLAUDE_BAR is a test input and needs CREWTALK_CODEX_BIN"
+  case $CREWTALK_VERIFY_CLAUDE_BAR in
+    *[!0-9.]* | *.*.* | . ) usage_error "CREWTALK_VERIFY_CLAUDE_BAR must be a number of seconds" ;;
+  esac
+  claude_bar=$CREWTALK_VERIFY_CLAUDE_BAR
+fi
+thread=${CREWTALK_VERIFY_CODEX_THREAD:-}
+thread_2=${CREWTALK_VERIFY_CODEX_THREAD_2:-}
+if [ -n "$thread_2" ] && [ "$(printf %s "$thread" | tr A-F a-f)" = "$(printf %s "$thread_2" | tr A-F a-f)" ]; then
+  usage_error "CREWTALK_VERIFY_CODEX_THREAD_2 must be a different thread from CREWTALK_VERIFY_CODEX_THREAD"
+fi
+unset HERDR_ENV
+home=${CREWTALK_HOME:-$HOME/.crewtalk}
+
+cd "$(dirname "$0")/.." || exit 3
+mkdir -p .local/verify || exit 3
+until evidence=.local/verify/$(date -u +%Y%m%dT%H%M%SZ) && mkdir "$evidence" 2>/dev/null; do
+  sleep 1
+done
+logs=$evidence/logs
+mkdir "$logs"
+listener=verify-$(basename "$evidence" | tr -dc 0-9)
+
+commit=$(git rev-parse HEAD 2>/dev/null)
+dirty=null
+if porcelain=$(git status --porcelain 2>/dev/null); then
+  dirty=false
+  [ -z "$porcelain" ] || dirty=true
+fi
+binary_sha256=
+
+stand_in=
+tags=
+if [ -n "${CREWTALK_CODEX_BIN:-}" ]; then
+  stand_in="CREWTALK_CODEX_BIN=$CREWTALK_CODEX_BIN replaces codex in the codex route"
+  tags=crewtalk_test
+fi
+
+key() { printf %s "$1" | tr - _; }
+record() {
+  printf -v "state_$(key "$1")" %s "$2"
+  printf -v "reason_$(key "$1")" %s "$3"
+}
+state_of() { local v; v=state_$(key "$1"); printf %s "${!v}"; }
+reason_of() { local v; v=reason_$(key "$1"); printf %s "${!v}"; }
+record_set() {
+  local j
+  for j in $1; do record "$j" "$2" "$3"; done
+}
+
+json_str() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\t'/\\t}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\n'/\\n}
+  printf '"%s"' "$s"
+}
+
+now() { perl -MTime::HiRes=time -e 'printf "%.3f", time'; }
+iso() { perl -MPOSIX=strftime -e 'printf "%s.%03dZ", strftime("%Y-%m-%dT%H:%M:%S", gmtime $ARGV[0]), ($ARGV[0] * 1000) % 1000' "$1"; }
+secs() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.3f", b - a }'; }
+over() { awk -v t="$1" -v bar="$2" 'BEGIN { exit !(t >= bar) }'; }
+first_line() { sed -n '/./{p;q;}' "$@"; }
+new_marker() { printf crewtalk-verify-%s "$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"; }
+sha256() { shasum -a 256 <"$1" | cut -d ' ' -f 1; }
+field() { perl -MJSON::PP -e 'my $v = eval { decode_json($ARGV[0])->{$ARGV[1]} }; defined $v or exit 1; print $v' "$1" "$2"; }
+results_of() {
+  ID=$2 perl -MJSON::PP -ne '
+    my $e = eval { decode_json($_) } or next;
+    print join(" ", $e->{result}, $e->{held_for} // ()), "\n" if $e->{id} eq $ENV{ID};
+  ' "$1"
+}
+count_result() {
+  RESULT=$2 perl -MJSON::PP -ne '
+    my $e = eval { decode_json($_) } or next;
+    $n++ if $e->{result} eq $ENV{RESULT};
+    END { print $n // 0 }
+  ' "$1"
+}
+
+delivery_seconds() {
+  perl -MTime::HiRes=stat -MTime::Local=timegm -e '
+    my $file = shift;
+    open my $in, "<", $file or exit 1;
+    my $header = <$in>;
+    $header =~ /, id (\d{4})(\d\d)(\d\d)T(\d\d)(\d\d)(\d\d)(\.\d+)Z-/ or exit 1;
+    printf "%.3f", (stat $file)[9] - (timegm($6, $5, $4, $3, $2 - 1, $1) + $7);
+  ' "$1"
+}
+
+times_json=
+add_time() { times_json+="${times_json:+, }$(json_str "$1"): $(json_str "$2")"; }
+
+finish() {
+  local code=${1:-0} j st reason line states="" reasons=""
+  echo "commit: ${commit:-unknown}, dirty: $dirty, crewtalk sha256: ${binary_sha256:-not built}" | tee -a "$evidence/summary.md"
+  [ -z "$stand_in" ] || echo "stand-in: $stand_in" | tee -a "$evidence/summary.md"
+  for j in $selected; do
+    st=$(state_of "$j")
+    reason=$(reason_of "$j")
+    case $st:$mode:$feature in
+      proven:* | skipped:fast: | skipped:fast:codex-rule) ;;
+      *) [ "$code" -ne 0 ] || code=1 ;;
+    esac
+    line="$j: $st"
+    [ -z "$reason" ] || line+=" ($reason)"
+    echo "$line" | tee -a "$evidence/summary.md"
+    states+="${states:+, }$(json_str "$j"): $(json_str "$st")"
+    reasons+="${reasons:+, }$(json_str "$j"): $(json_str "$reason")"
+  done
+  cat >"$evidence/summary.json" <<EOF
+{
+  "mode": $(json_str "$mode"),
+  "commit": $(json_str "$commit"),
+  "dirty": $dirty,
+  "binary_sha256": $(json_str "$binary_sha256"),
+  "journeys": {$states},
+  "reasons": {$reasons},
+  "stand_ins": [$([ -z "$stand_in" ] || json_str "$stand_in")],
+  "codex_thread": $(json_str "$thread"),
+  "codex_thread_2": $(json_str "$thread_2"),
+  "listener": $(json_str "claude:$listener"),
+  "crewtalk_home": $(json_str "$home"),
+  "bars": {"codex_queue_seconds": $codex_bar, "claude_route_seconds": $claude_bar},
+  "times": {$times_json},
+  "exit": $code
+}
+EOF
+  echo "verify $mode: exit $code, evidence $evidence/" | tee -a "$evidence/summary.md"
+  exit "$code"
+}
+
+waiter=
+waiters=" "
+joined=
+entry=
+start_wait() {
+  CREWTALK_HOME=$2 "$bin" wait --as "$1" --timeout "${timeout}s" >"$3" 2>"$4" &
+  waiter=$!
+  waiters+="$waiter "
+  echo "$waiter" >>"$logs/listeners.pid"
+}
+
+listen() {
+  local name=$1 at=$2 out=$3 err=$4 socket=$2/inbox/$1.sock tries=0
+  joined+=$at/$name$'\n'
+  start_wait "$name" "$at" "$out" "$err"
+  until [ -S "$socket" ]; do
+    if ! kill -0 "$waiter" 2>/dev/null; then
+      wait "$waiter"
+      why="crewtalk wait exited $? before listening: $(first_line "$err")"
+      return 1
+    fi
+    if [ $((tries += 1)) -gt 100 ]; then
+      why="no listener socket at $socket after 10 s"
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
+reap() {
+  local polls=0 code
+  while kill -0 "$1" 2>/dev/null && [ $((polls += 1)) -le $(($2 * 20)) ]; do
+    sleep 0.05
+  done
+  ! kill -0 "$1" 2>/dev/null || kill "$1"
+  wait "$1"
+  code=$?
+  waiters=${waiters/ $1 / }
+  return "$code"
+}
+
+sent=
+hop() {
+  local journey=$1 at=$2 from=$3 to=$4 pid=$5 out=$6 marker code
+  shift 6
+  marker=$(new_marker)
+  sent=$(CREWTALK_HOME=$at "$bin" send --json --to "$to" --from "$from" "$@" "$marker" 2>"$logs/$journey-send.err")
+  code=$?
+  printf 'send from %s to %s %s, exit %s: %s %s\n' "$from" "$to" "$*" "$code" "$sent" "$(cat "$logs/$journey-send.err")" >>"$logs/$journey.log"
+  if [ "$code" -ne 0 ]; then
+    why="crewtalk send from $from to $to exited $code: $(first_line "$logs/$journey-send.err")"
+    return 1
+  fi
+  reap "$pid" 10
+  code=$?
+  if [ "$code" -ne 0 ] || ! grep -qxF "$marker" "$out"; then
+    why="$to did not print the marker (crewtalk wait exit $code)"
+    return 1
+  fi
+  if ! head -n 1 "$out" | grep -qF "[crewtalk from claude:${from#claude:} to claude:${to#claude:}, "; then
+    why="the header at $to does not name $from as the sender: $(head -n 1 "$out")"
+    return 1
+  fi
+  if ! delivered=$(delivery_seconds "$out"); then
+    why="no message id time in the header at $to: $(head -n 1 "$out")"
+    return 1
+  fi
+  if over "$delivered" "$claude_bar"; then
+    why="the Claude route delivery from $from to $to took $delivered s, bar under $claude_bar s"
+    return 1
+  fi
+}
+
+claude_claude() {
+  local at=$build/claude-claude a=$listener-a b=$listener-b a_pid b_pid to_b to_a lines
+  listen "$a" "$at" "$logs/claude-claude-a.txt" "$logs/claude-claude-a.err" || { record claude-claude failed "$why"; return; }
+  a_pid=$waiter
+  listen "$b" "$at" "$logs/claude-claude-b.txt" "$logs/claude-claude-b.err" || { record claude-claude failed "$why"; return; }
+  b_pid=$waiter
+  hop claude-claude "$at" "claude:$a" "claude:$b" "$b_pid" "$logs/claude-claude-b.txt" || { record claude-claude failed "$why"; return; }
+  to_b=$delivered
+  hop claude-claude "$at" "claude:$b" "claude:$a" "$a_pid" "$logs/claude-claude-a.txt" || { record claude-claude failed "$why"; return; }
+  to_a=$delivered
+  add_time claude_claude_to_b_seconds "$to_b"
+  add_time claude_claude_to_a_seconds "$to_a"
+  cp "$at/log.jsonl" "$logs/claude-claude-journal.jsonl"
+  lines=$(grep -cF '"result":"delivered"' "$at/log.jsonl")
+  if [ "$lines" -ne 2 ]; then
+    record claude-claude failed "the journal has $lines delivered lines, want 2"
+    return
+  fi
+  record claude-claude proven "Claude route delivery $to_b s to claude:$b, $to_a s to claude:$a"
+}
+
+by_name() {
+  local at=$build/by-name a=$listener-a b=$listener-b a_pid b_pid id thread header
+  listen "$a" "$at" "$logs/by-name-a.txt" "$logs/by-name-a.err" || { record by-name failed "$why"; return; }
+  a_pid=$waiter
+  listen "$b" "$at" "$logs/by-name-b.txt" "$logs/by-name-b.err" || { record by-name failed "$why"; return; }
+  b_pid=$waiter
+  hop by-name "$at" "$a" "$b" "$b_pid" "$logs/by-name-b.txt" || { record by-name failed "$why"; return; }
+  if ! id=$(field "$sent" id) || ! thread=$(field "$sent" thread); then
+    record by-name failed "the first send printed no id and thread: $sent"
+    return
+  fi
+  hop by-name "$at" "$b" "$a" "$a_pid" "$logs/by-name-a.txt" --reply-to "$id" || { record by-name failed "$why"; return; }
+  header=$(head -n 1 "$logs/by-name-a.txt")
+  case $header in
+    *", thread $thread, turn 2, reply-to $id, id "*) ;;
+    *) record by-name failed "the reply header does not carry thread $thread, turn 2 and reply-to $id: $header"; return ;;
+  esac
+  cp "$at/log.jsonl" "$logs/by-name-journal.jsonl"
+  if ! grep -qF "\"reply_to\":\"$id\"" "$at/log.jsonl"; then
+    record by-name failed "the journal has no line with reply_to $id"
+    return
+  fi
+  record by-name proven "the reply by name carries thread $thread, turn 2 and reply-to $id"
+}
+
+held() {
+  local at=$build/held name=$listener-h from=claude:$listener-s marker id code results held_for
+  joined+=$at/$name$'\n'
+  if ! CREWTALK_HOME=$at "$bin" join --as "$name" --kind claude >>"$logs/held.log" 2>&1; then
+    record held failed "crewtalk join --as $name --kind claude failed: $(first_line "$logs/held.log")"
+    return
+  fi
+  marker=$(new_marker)
+  sent=$(CREWTALK_HOME=$at "$bin" send --json --from "$from" --to "$name" "$marker" 2>>"$logs/held.log")
+  code=$?
+  echo "send to $name with no listener, exit $code: $sent" >>"$logs/held.log"
+  if [ "$code" -ne 0 ]; then
+    record held failed "the send to $name with no listener exited $code, want 0 (held)"
+    return
+  fi
+  if [ "$(field "$sent" result)" != held ] || ! id=$(field "$sent" id); then
+    record held failed "the send to $name with no listener did not print result held and an id: $sent"
+    return
+  fi
+  CREWTALK_HOME=$at "$bin" wait --as "$name" --timeout 10s >"$logs/held.txt" 2>"$logs/held-wait.err"
+  code=$?
+  if [ "$code" -ne 0 ] || ! grep -qxF "$marker" "$logs/held.txt"; then
+    record held failed "crewtalk wait --as $name did not print the held message (exit $code): $(first_line "$logs/held-wait.err")"
+    return
+  fi
+  case $(head -n 1 "$logs/held.txt") in
+    "[crewtalk from $from to claude:$name, "*", id $id; "*) ;;
+    *) record held failed "the held message header does not name $from and id $id: $(head -n 1 "$logs/held.txt")"; return ;;
+  esac
+  CREWTALK_HOME=$at "$bin" wait --as "$name" --timeout 1s >"$logs/held-again.txt" 2>>"$logs/held-wait.err"
+  code=$?
+  if [ "$code" -ne 4 ]; then
+    record held failed "a second crewtalk wait --as $name exited $code, want 4 (nothing held); it printed: $(first_line "$logs/held-again.txt")"
+    return
+  fi
+  cp "$at/log.jsonl" "$logs/held-journal.jsonl"
+  results=$(results_of "$at/log.jsonl" "$id" | tr '\n' ' ')
+  held_for=${results#held delivered }
+  case $results in
+    "held delivered "[0-9]*" ") ;;
+    *) record held failed "the journal lines for $id are \"$results\", want held, then delivered with held_for"; return ;;
+  esac
+  record held proven "held, then printed by the next crewtalk wait; journal held_for ${held_for% }"
+}
+
+limits() {
+  local at=$build/limits a=$listener-a b=$listener-b thread=$listener-limits turn from to pid id='' code marker refused paused
+  for turn in 1 2 3 4 5 6; do
+    from=$a to=$b
+    [ $((turn % 2)) -eq 1 ] || from=$b to=$a
+    listen "$to" "$at" "$logs/limits-$turn.txt" "$logs/limits-$turn.err" || { record limits failed "turn $turn: $why"; return; }
+    pid=$waiter
+    if [ -z "$id" ]; then
+      set -- --thread "$thread"
+    else
+      set -- --reply-to "$id"
+    fi
+    hop limits "$at" "claude:$from" "claude:$to" "$pid" "$logs/limits-$turn.txt" "$@" || { record limits failed "turn $turn: $why"; return; }
+    id=$(field "$sent" id) || { record limits failed "turn $turn printed no id: $sent"; return; }
+  done
+  listen "$b" "$at" "$logs/limits-last.txt" "$logs/limits-last.err" || { record limits failed "$why"; return; }
+  pid=$waiter
+  marker=$(new_marker)
+  CREWTALK_HOME=$at "$bin" send --to "claude:$b" --from "claude:$a" --reply-to "$id" "$marker" >>"$logs/limits.log" 2>"$logs/limits-turn-7.err"
+  code=$?
+  echo "turn 7, exit $code: $(cat "$logs/limits-turn-7.err")" >>"$logs/limits.log"
+  if [ "$code" -ne 3 ] || [ "$(grep -c . "$logs/limits-turn-7.err")" -ne 1 ]; then
+    record limits failed "the seventh turn exited $code with $(grep -c . "$logs/limits-turn-7.err") stderr lines, want exit 3 and one line"
+    return
+  fi
+  touch "$at/PAUSE"
+  CREWTALK_HOME=$at "$bin" send --to "claude:$b" --from "claude:$a" --thread "$thread-paused" "$marker" >>"$logs/limits.log" 2>"$logs/limits-paused.err"
+  code=$?
+  rm -f "$at/PAUSE"
+  echo "send while PAUSE exists, exit $code: $(cat "$logs/limits-paused.err")" >>"$logs/limits.log"
+  if [ "$code" -ne 3 ] || [ "$(grep -c . "$logs/limits-paused.err")" -ne 1 ]; then
+    record limits failed "the send while PAUSE exists exited $code with $(grep -c . "$logs/limits-paused.err") stderr lines, want exit 3 and one line"
+    return
+  fi
+  hop limits "$at" "claude:$a" "claude:$b" "$pid" "$logs/limits-last.txt" --thread "$thread-after" || { record limits failed "the send after PAUSE was removed: $why"; return; }
+  if grep -qxF "$marker" "$logs/limits-last.txt"; then
+    record limits failed "the listener printed a refused message"
+    return
+  fi
+  cp "$at/log.jsonl" "$logs/limits-journal.jsonl"
+  refused=$(count_result "$at/log.jsonl" refused-limit)
+  paused=$(count_result "$at/log.jsonl" refused-paused)
+  if [ "$refused" -ne 1 ] || [ "$paused" -ne 1 ]; then
+    record limits failed "the journal has $refused refused-limit and $paused refused-paused lines, want 1 each"
+    return
+  fi
+  record limits proven "turn 7 refused with exit 3, a send under PAUSE refused with exit 3, and the listener got only the send after PAUSE was removed"
+}
+
+two_projects() {
+  local lead=$listener-lead names threads markers ids conversations i marker code n out header
+  names=("$listener-a" "$listener-b")
+  threads=("$thread" "$thread_2")
+  for i in 0 1; do
+    joined+=$home/${names[i]}$'\n'
+    if ! CREWTALK_HOME=$home "$bin" join --as "${names[i]}" --kind codex --address "${threads[i]}" >>"$logs/two-projects.log" 2>&1; then
+      record two-projects failed "crewtalk join --as ${names[i]} --kind codex failed: $(first_line "$logs/two-projects.log")"
+      return
+    fi
+  done
+  listen "$lead" "$home" "$logs/two-projects-lead-1.txt" "$logs/two-projects-lead-1.err" || { record two-projects failed "$why"; return; }
+  for i in 0 1; do
+    marker=$(new_marker)
+    markers[i]=$marker
+    sent=$(CREWTALK_HOME=$home "$bin" send --json --from "$lead" --to "${names[i]}" "This is a crewtalk harness check from scripts/verify. In the command below, replace MESSAGE_ID with the id in the header of this message. Run the command, then end your turn:
+
+crewtalk send --to $lead --reply-to MESSAGE_ID $marker" 2>"$logs/two-projects-send.err")
+    code=$?
+    echo "send to ${names[i]}, exit $code: $sent $(cat "$logs/two-projects-send.err")" >>"$logs/two-projects.log"
+    if [ "$code" -ne 0 ]; then
+      record two-projects failed "crewtalk send to ${names[i]} exited $code: $(first_line "$logs/two-projects-send.err")"
+      return
+    fi
+    if ! ids[i]=$(field "$sent" id) || ! conversations[i]=$(field "$sent" thread); then
+      record two-projects failed "the send to ${names[i]} printed no id and thread: $sent"
+      return
+    fi
+  done
+  if [ "${conversations[0]}" = "${conversations[1]}" ]; then
+    record two-projects failed "both instructions share thread ${conversations[0]}"
+    return
+  fi
+  for n in 1 2; do
+    [ "$n" -eq 1 ] || start_wait "$lead" "$home" "$logs/two-projects-lead-$n.txt" "$logs/two-projects-lead-$n.err"
+    reap "$waiter" $((timeout + 10))
+    code=$?
+    echo "crewtalk wait $n exit $code" >>"$logs/two-projects.log"
+    [ "$code" -eq 0 ] || break
+  done
+  grep -F "$lead" "$home/log.jsonl" >"$logs/two-projects-journal.jsonl"
+  for i in 0 1; do
+    out=$(grep -lxF "${markers[i]}" "$logs"/two-projects-lead-*.txt)
+    if [ -z "$out" ]; then
+      record two-projects failed "no reply from ${names[i]} (codex:${threads[i]}) within $timeout s (crewtalk wait exit $code); its instruction was queued"
+      return
+    fi
+    header=$(head -n 1 "$out")
+    case $header in
+      "[crewtalk from codex:${threads[i]} to claude:$lead, thread ${conversations[i]}, turn 2, reply-to ${ids[i]}, id "*) ;;
+      *) record two-projects failed "the reply from ${names[i]} does not carry codex:${threads[i]}, thread ${conversations[i]}, turn 2 and reply-to ${ids[i]}: $header"; return ;;
+    esac
+  done
+  record two-projects proven "both replies reached $lead, each in its own thread at turn 2 with --reply-to: ${conversations[0]}, ${conversations[1]}"
+}
+
+codex_rule() {
+  local rules=$HOME/.codex/rules/default.rules form
+  if ! rule_decision crewtalk send --to lead ready; then
+    record codex-rule failed "$why"
+    return
+  fi
+  if [ "$decision" != allow ]; then
+    record codex-rule failed "$rules does not allow crewtalk send (decision: ${decision:-none})"
+    return
+  fi
+  if ! rule_decision herdr agent prompt worker ready; then
+    record codex-rule failed "$why"
+    return
+  fi
+  if [ "$decision" = allow ]; then
+    record codex-rule failed "$rules allows herdr agent prompt"
+    return
+  fi
+  for form in PATH=/x CREWTALK_HOME=/x; do
+    if ! rule_decision "$form" crewtalk send --to lead ready; then
+      record codex-rule failed "$why"
+      return
+    fi
+    if [ "$decision" = allow ]; then
+      record codex-rule failed "$rules allows $form crewtalk send"
+      return
+    fi
+  done
+  record codex-rule proven "$rules allows crewtalk send and does not allow herdr agent prompt, PATH=/x crewtalk send or CREWTALK_HOME=/x crewtalk send"
+}
+
+decision=
+rule_decision() {
+  local result code
+  result=$(codex execpolicy check --rules "$rules" "$@" 2>&1)
+  code=$?
+  echo "$*, exit $code: $result" >>"$logs/codex-rule.log"
+  if [ "$code" -ne 0 ] || ! field "$result" matchedRules >/dev/null; then
+    why="codex execpolicy check $* exited $code without a decision: $(printf '%s\n' "$result" | first_line)"
+    return 1
+  fi
+  decision=$(field "$result" decision) || decision=
+}
+
+round_trip() {
+  local marker reply_cmd request pid sent queued received send_code wait_code lines send_seconds trip reply_seconds
+  marker=$(new_marker)
+  reply_cmd=$(printf '%q ' crewtalk send --to "claude:$listener" "$marker")
+  reply_cmd=${reply_cmd% }
+  request="This is a crewtalk harness check from scripts/verify. Run this one command exactly as written, then end your turn:
+
+$reply_cmd"
+
+  {
+    echo "listener: claude:$listener"
+    echo "marker: $marker"
+    echo "reply command: $reply_cmd"
+  } >"$logs/codex-claude.log"
+  if ! listen "$listener" "$home" "$logs/reply.txt" "$logs/wait.err"; then
+    record claude-codex failed "not run: $why"
+    record codex-claude failed "$why"
+    return
+  fi
+  pid=$waiter
+
+  {
+    echo "to: codex:$thread"
+    echo "from: claude:$listener"
+    echo "request:"
+    echo "$request"
+  } >"$logs/claude-codex.log"
+  sent=$(now)
+  add_time request_sent "$(iso "$sent")"
+  "$bin" send --json --to "codex:$thread" --from "claude:$listener" --thread "$listener" "$request" \
+    >"$logs/request.json" 2>"$logs/request.err"
+  send_code=$?
+  queued=$(now)
+  send_seconds=$(secs "$sent" "$queued")
+  add_time request_returned "$(iso "$queued")"
+  add_time request_send_seconds "$send_seconds"
+  echo "crewtalk send exit $send_code after $send_seconds s" >>"$logs/claude-codex.log"
+  if [ "$send_code" -ne 0 ]; then
+    record claude-codex failed "crewtalk send exited $send_code: $(first_line "$logs/request.err" "$logs/request.json")"
+    record codex-claude failed "not run: the request was not delivered"
+    return
+  fi
+
+  reap "$pid" $((timeout + 10))
+  wait_code=$?
+  received=$(now)
+  trip=$(secs "$sent" "$received")
+  add_time reply_received "$(iso "$received")"
+  add_time round_trip_seconds "$trip"
+  echo "crewtalk wait exit $wait_code at $(iso "$received"), $trip s after the send" >>"$logs/codex-claude.log"
+
+  if [ "$wait_code" -ne 0 ] || ! grep -qxF "$marker" "$logs/reply.txt"; then
+    record_set "$codex_run" failed "no reply with the marker within $timeout s (crewtalk wait exit $wait_code); the request was queued"
+    return
+  fi
+  if ! head -n 1 "$logs/reply.txt" | grep -qF "[crewtalk from codex:$thread "; then
+    record_set "$codex_run" failed "the reply header does not name codex:$thread as the sender: $(head -n 1 "$logs/reply.txt")"
+    return
+  fi
+
+  lines=0
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    grep -F "\"claude:$listener\"" "$home/log.jsonl" >"$logs/journal.jsonl" 2>/dev/null
+    lines=$(grep -cF '"result":"delivered"' "$logs/journal.jsonl")
+    [ "$lines" -lt 2 ] || break
+    sleep 0.5
+  done
+  if [ "$lines" -ne 2 ]; then
+    record_set "$codex_run" failed "$home/log.jsonl has $lines delivered lines for $listener, want 2"
+    return
+  fi
+
+  if ! reply_seconds=$(delivery_seconds "$logs/reply.txt"); then
+    record_set "$codex_run" failed "no message id time in the reply header: $(head -n 1 "$logs/reply.txt")"
+    return
+  fi
+  add_time reply_delivery_seconds "$reply_seconds"
+  if over "$send_seconds" "$codex_bar"; then
+    record claude-codex failed "the codex queue call took $send_seconds s, bar under $codex_bar s; round trip $trip s"
+  else
+    record claude-codex proven "round trip $trip s, codex queue call $send_seconds s"
+  fi
+  if over "$reply_seconds" "$claude_bar"; then
+    record codex-claude failed "the reply's Claude route delivery took $reply_seconds s, bar under $claude_bar s"
+  else
+    record codex-claude proven "round trip $trip s, Claude route delivery $reply_seconds s"
+  fi
+}
+
+record_set "$selected" failed "not run"
+codex_run=
+two_run=
+rule_run=
+for j in $selected; do
+  case $j in
+    claude-codex | codex-claude) codex_run+=" $j" ;;
+    two-projects) two_run=$j ;;
+    codex-rule) rule_run=$j ;;
+  esac
+done
+if [ -n "$codex_run" ] && [ -z "$thread" ]; then
+  record_set "$codex_run" skipped "CREWTALK_VERIFY_CODEX_THREAD is not set"
+  codex_run=
+fi
+if [ -n "$two_run" ] && { [ -z "$thread" ] || [ -z "$thread_2" ]; }; then
+  record two-projects skipped "CREWTALK_VERIFY_CODEX_THREAD and CREWTALK_VERIFY_CODEX_THREAD_2 must both be set"
+  two_run=
+fi
+if [ -n "$rule_run" ] && [ "$mode" = fast ]; then
+  record codex-rule skipped "scripts/verify full only"
+  rule_run=
+fi
+replies_run=$codex_run$two_run
+
+codex=${CREWTALK_CODEX_BIN:-codex}
+codex_used=$replies_run$rule_run
+for tool in go perl shasum ${codex_used:+"$codex"}; do
+  command -v "$tool" >/dev/null || {
+    record_set "$selected" skipped "doctor: $tool not found"
+    finish 3
+  }
+done
+
+if [ -n "$replies_run" ] && [ -z "${CREWTALK_CODEX_BIN:-}" ] && ! command -v crewtalk >/dev/null; then
+  record_set "$selected" skipped "doctor: crewtalk is not on PATH, so the Codex session cannot run the reply; install it with: go build -o ~/.local/bin/crewtalk ./cmd/crewtalk (~/.local/bin must be on PATH)"
+  finish 3
+fi
+
+build=$(mktemp -d /tmp/crewtalk-verify.XXXXXX) || exit 3
+trap '[ -z "${waiters// /}" ] || { kill $waiters; wait $waiters; } 2>/dev/null
+while IFS= read -r entry; do
+  [ -z "$entry" ] || CREWTALK_HOME=${entry%/*} "$bin" leave --as "${entry##*/}" >>"$logs/leave.log" 2>&1
+done <<<"$joined"
+rm -rf "$build"' EXIT
+bin=$build/crewtalk
+if ! go build -tags "$tags" -o "$bin" ./cmd/crewtalk >"$logs/build.log" 2>&1; then
+  record_set "$selected" failed "go build ./cmd/crewtalk failed: $(first_line "$logs/build.log"); see $logs/build.log"
+  finish
+fi
+binary_sha256=$(sha256 "$bin")
+
+if [ -n "$replies_run" ] && [ -z "${CREWTALK_CODEX_BIN:-}" ]; then
+  installed=$(command -v crewtalk)
+  if [ "$(sha256 "$installed")" != "$binary_sha256" ]; then
+    record_set "$selected" skipped "doctor: the crewtalk on PATH ($installed) differs from the build under test, so the Codex session would reply with another build; rebuild it with: go build -o $installed ./cmd/crewtalk"
+    finish 3
+  fi
+fi
+
+PATH=$build:$PATH
+export PATH
+for j in $selected; do
+  case $j in
+    claude-claude) claude_claude ;;
+    by-name) by_name ;;
+    held) held ;;
+    limits) limits ;;
+    two-projects) [ -z "$two_run" ] || two_projects ;;
+    codex-rule) [ -z "$rule_run" ] || codex_rule ;;
+  esac
+done
+[ -z "$codex_run" ] || round_trip
+finish

@@ -1,0 +1,46 @@
+minimum_pre_commit_version: "3.2.0"
+default_install_hook_types:
+  - pre-commit
+  - commit-msg
+  - pre-push
+repos:
+  - repo: local
+    hooks:
+      - id: first-commit-staged
+        name: first-commit staged hygiene
+        entry: first-commit hook pre-commit
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: first-commit-message
+        name: first-commit commit-message hygiene
+        entry: first-commit hook commit-msg
+        language: system
+        always_run: true
+        pass_filenames: true
+        stages: [commit-msg]
+        verbose: true
+      - id: first-commit-push
+        name: first-commit pre-push hygiene
+        entry: first-commit hook pre-push
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-push]
+      - id: first-commit-doctor
+        name: first-commit doctor
+        entry: first-commit doctor
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [manual]
+        verbose: true
+      - id: first-commit-check
+        name: first-commit check
+        entry: first-commit check
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [manual]
+        verbose: true

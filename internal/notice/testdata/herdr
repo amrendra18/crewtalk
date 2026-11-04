@@ -1,0 +1,12 @@
+#!/bin/sh
+printf '%s\0' "$@" >> "$FAKE_HERDR_CALLS"
+printf '\n' >> "$FAKE_HERDR_CALLS"
+case "$FAKE_HERDR_MODE" in
+fail)
+	echo "herdr: no such pane" >&2
+	exit 1
+	;;
+hang)
+	exec sleep 30
+	;;
+esac

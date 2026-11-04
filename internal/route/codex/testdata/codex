@@ -1,0 +1,47 @@
+#!/bin/sh
+echo run >> "$FAKE_CODEX_RUNS"
+printf '%s\0' "$@" > "$FAKE_CODEX_ARGS"
+thread=${2#--thread=}
+case "$FAKE_CODEX_MODE" in
+ok)
+	echo "Queued message 01a19f92 for thread $thread"
+	;;
+inactive)
+	echo "Error: No active session found matching '$thread'." >&2
+	exit 1
+	;;
+unknown)
+	echo "Error: failed to queue session message: thread/queue/add failed: failed to read thread: invalid thread-store request: no rollout found for thread id $thread (code -32603)" >&2
+	exit 1
+	;;
+other)
+	echo "Error: the daemon is not running" >&2
+	echo "more detail" >&2
+	exit 1
+	;;
+usage)
+	echo "error: the following required arguments were not provided:" >&2
+	exit 2
+	;;
+reply)
+	command=$(printf '%s\n' "$4" | grep -E '^crewtalk send --to ' | tail -n 1)
+	[ -n "$command" ] || { echo "fake codex: the message holds no reply command" >&2; exit 1; }
+	echo "Queued message fake for thread $thread"
+	[ "$thread" != "$FAKE_CODEX_SILENT_THREAD" ] || exit 0
+	id=$(printf '%s\n' "$4" | sed -n '1s/.*, id \([^;]*\);.*/\1/p')
+	command=$(printf '%s\n' "$command" | sed "s/MESSAGE_ID/$id/")
+	(
+		tries=0
+		until grep -qF "\"$id\"" "${CREWTALK_HOME:-$HOME/.crewtalk}/log.jsonl" || [ $((tries += 1)) -gt 100 ]; do
+			sleep 0.1
+		done
+		set -f
+		CODEX_THREAD_ID=$thread $command
+	) </dev/null >/dev/null 2>&1 &
+	;;
+hang)
+	sleep 30 &
+	echo $! > "$FAKE_CODEX_PID"
+	wait
+	;;
+esac

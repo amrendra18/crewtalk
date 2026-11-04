@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: scripts/check fast|full
+
+  fast   gofmt -l; every test that AGENTS.md names exists, a hand journey as a
+         heading in verify/hand-journey.md;
+         verify/features/ holds one file per scripts/verify journey;
+         shellcheck on every shell script; go vet and staticcheck, each on
+         the normal and the -tags crewtalk_test build; go test ./...
+  full   fast, then one scripts/verify fast run with the fake codex
+         internal/route/codex/testdata/codex in reply mode (a test input), a
+         temporary CREWTALK_HOME under /tmp and two fixed fake thread ids;
+         every journey must be proven, except codex-rule, which fast must
+         report skipped. Then two more test inputs must make claude-codex
+         fail: the same fake in unknown mode, and a stand-in that waits 2 s
+         before it runs the fake, which misses the codex queue bar. A third,
+         CREWTALK_VERIFY_CLAUDE_BAR=0, must make claude-claude and
+         codex-claude miss the Claude route bar. Two more must make
+         two-projects fail: a fake worker that never replies, and a stand-in
+         worker that replies without --reply-to. Without the second thread
+         scripts/verify full must skip two-projects and exit 1, and the same
+         thread twice must exit 64. A stand-in codex that allows only crewtalk
+         send must get codex-rule proven. One that answers with no decision,
+         then one that answers allow, must make codex-rule fail, and so must
+         one that allows PATH=/x crewtalk send, and one that allows
+         CREWTALK_HOME=/x crewtalk send.
+         After the runs, the address book must hold no verify- name. After
+         every run, no crewtalk wait that the run started may still be
+         running. A codex, a claude and a herdr that refuse to run come first
+         on PATH, so no real session is contacted. The live check is
+         scripts/verify full.
+
+Both modes unset HERDR_ENV, so no test shows an operator notice.
+
+Exit codes: 0 every check passed, 1 a check failed, 64 usage error.
+fast and full end with "check <mode>: exit <code>"; a usage error ends with
+"check usage: exit 64".
+EOF
+}
+
+fail() {
+  echo "check: $1 failed" >&2
+  exit 1
+}
+
+need() {
+  command -v "$1" >/dev/null || {
+    echo "check: $1 is not on PATH; install it from $2" >&2
+    exit 1
+  }
+}
+
+gofmt_clean() {
+  local unformatted
+  unformatted=$(git ls-files -z -co --exclude-standard -- '*.go' | xargs -0 -r gofmt -l) || return 1
+  [ -z "$unformatted" ] || { printf 'check: not formatted:\n%s\n' "$unformatted" >&2; return 1; }
+}
+
+journey_names() { sed -n 's/^journeys="\(.*\)"$/\1/p' scripts/verify; }
+
+agents_test_names() {
+  perl -0777 -ne '
+    for my $item (split /\n[ \t]*\n|\n(?=[ \t]*(?:\d+\.|[-*])[ \t])/) {
+      next unless $item =~ /\bTests?:(.*)/s;
+      (my $clause = $1) =~ s/\s+/ /g;
+      for my $group (split /;|\.(?:\s|$)/, $clause) {
+        my ($names, $places) = $group =~ /^(.*?)\bin\s+(?=`)(.*)$/ ? ($1, $2) : ($group, "");
+        my @packages = $places =~ /`([^`]+)`/g;
+        for my $name ($names =~ /`([^`]+)`/g) {
+          print join(" ", $name, @packages), "\n" unless $name =~ m{[/\s~.]};
+        }
+      }
+    }' AGENTS.md
+}
+
+named_tests_exist() {
+  local names name packages package pattern journeys missing=
+  names=$(agents_test_names)
+  [ -n "$names" ] || { echo "check: AGENTS.md names no tests" >&2; return 1; }
+  journeys=" $(journey_names) "
+  while read -r name packages; do
+    if [[ $name =~ ^Test[A-Za-z0-9_]+\*?$ ]]; then
+      pattern="^func ${name%\*}"
+      [ "$name" != "${name%\*}" ] || pattern+='\('
+      if [ -z "$packages" ]; then
+        git grep --untracked -qE "$pattern" -- '*_test.go' || missing+=" $name"
+      fi
+      for package in $packages; do
+        git grep --untracked -qE "$pattern" -- ":(glob)$package/*_test.go" || missing+=" $name in $package"
+      done
+    else
+      case $journeys in
+        *" ${name#journey-} "*) ;;
+        *) grep -qxF "## $name" verify/hand-journey.md || missing+=" $name" ;;
+      esac
+    fi
+  done <<<"$names"
+  [ -z "$missing" ] || { echo "check: AGENTS.md names tests that do not exist:$missing" >&2; return 1; }
+}
+
+feature_map_complete() {
+  local want have
+  want=$(journey_names | tr ' ' '\n' | sort)
+  have=$(printf '%s\n' verify/features/*.md | sed 's|.*/||; s|\.md$||' | sort)
+  [ "$have" = "$want" ] || {
+    echo "check: verify/features/ must hold NAME.md for each journey in scripts/verify (${want//$'\n'/ }); it holds: ${have//$'\n'/ }" >&2
+    return 1
+  }
+}
+
+shell_scripts() {
+  local f
+  while IFS= read -r -d '' f; do
+    if [ -f "$f" ] && head -n 1 "$f" | grep -qE '^#!.*[/ ](ba)?sh( |$)'; then
+      printf '%s\0' "$f"
+    fi
+  done < <(git ls-files -z -co --exclude-standard)
+}
+
+run_fast() {
+  need shellcheck https://github.com/koalaman/shellcheck/releases
+  need staticcheck https://github.com/dominikh/go-tools/releases
+  gofmt_clean || fail "gofmt -l"
+  named_tests_exist || fail "the AGENTS.md test names"
+  feature_map_complete || fail "the verify/features/ map"
+  shell_scripts | xargs -0 shellcheck || fail "shellcheck"
+  go vet ./... || fail "go vet"
+  go vet -tags crewtalk_test ./... || fail "go vet -tags crewtalk_test"
+  staticcheck ./... || fail "staticcheck"
+  staticcheck -tags crewtalk_test ./... || fail "staticcheck -tags crewtalk_test"
+  go test ./... || fail "go test"
+}
+
+listener_left() {
+  local evidence pid
+  evidence=$(sed -n 's/^verify fast: exit [0-9]*, evidence \(.*\)$/\1/p' "$1")
+  [ -n "$evidence" ] && [ -f "$evidence/logs/listeners.pid" ] || return 1
+  while read -r pid; do
+    ! kill -0 "$pid" 2>/dev/null || return 0
+  done <"$evidence/logs/listeners.pid"
+  return 1
+}
+
+must_fail() {
+  local label=$1 out=$home/$2.out checks=()
+  shift 2
+  while [ "$1" != -- ]; do
+    checks+=("$1" "$2")
+    shift 2
+  done
+  shift
+  if "$@" >"$out" 2>&1; then
+    failed+=" $label-not-refused"
+    return
+  fi
+  set -- "${checks[@]}"
+  while [ $# -gt 0 ]; do
+    grep -q "$2" "$out" || failed+=" $1"
+    shift 2
+  done
+}
+
+run_full() {
+  local home j out code form failed=
+  run_fast
+  home=$(mktemp -d /tmp/crewtalk-check.XXXXXX) || fail "mktemp"
+  mkdir "$home/guard"
+  for j in codex claude herdr; do
+    printf '#!/bin/sh\necho "check: the real %s was called" >&2\nexit 99\n' "$j" >"$home/guard/$j"
+  done
+  printf '#!/bin/sh\nsleep 2\nexec "%s" "$@"\n' "$PWD/internal/route/codex/testdata/codex" >"$home/slow-codex"
+  cat >"$home/no-reply-to-codex" <<STUB
+#!/bin/sh
+exec "$PWD/internal/route/codex/testdata/codex" "\$1" "\$2" "\$3" "\$(printf '%s\n' "\$4" | sed 's/ --reply-to MESSAGE_ID//')"
+STUB
+  mkdir "$home/rule"
+  cat >"$home/rule/codex" <<'STUB'
+#!/bin/sh
+case ${FAKE_RULE_ALLOW:-} in
+*" $5 "*) echo '{"matchedRules":[],"decision":"allow"}' ;;
+*) echo "$FAKE_RULE_OUTPUT" ;;
+esac
+STUB
+  chmod +x "$home/guard/codex" "$home/guard/claude" "$home/guard/herdr" "$home/slow-codex" "$home/no-reply-to-codex" "$home/rule/codex"
+  export PATH=$home/guard:$PATH
+  export CREWTALK_HOME=$home CREWTALK_CODEX_BIN=$PWD/internal/route/codex/testdata/codex \
+    CREWTALK_VERIFY_CODEX_THREAD=11111111-2222-4333-8444-555555555555 \
+    CREWTALK_VERIFY_CODEX_THREAD_2=66666666-7777-4888-8999-aaaaaaaaaaaa \
+    FAKE_CODEX_RUNS=/dev/null FAKE_CODEX_ARGS=/dev/null CREWTALK_VERIFY_TIMEOUT=30
+  echo "check: test input: scripts/verify fast with $CREWTALK_CODEX_BIN in place of codex"
+  FAKE_CODEX_MODE=reply scripts/verify fast >"$home/reply.out" 2>&1 || failed+=" journeys"
+  cat "$home/reply.out"
+  for j in $(journey_names); do
+    [ "$j" = codex-rule ] || grep -q "^$j: proven" "$home/reply.out" || failed+=" $j-not-proven"
+  done
+  grep -q '^codex-rule: skipped' "$home/reply.out" || failed+=" codex-rule-not-skipped"
+  echo "check: test input: the same fake in its unknown-thread mode"
+  FAKE_CODEX_MODE=unknown must_fail unknown-thread unknown \
+    unknown-thread-not-named '^claude-codex: failed' -- \
+    scripts/verify fast --feature claude-codex
+  echo "check: test input: a stand-in that waits 2 s, past the codex queue bar"
+  FAKE_CODEX_MODE=reply CREWTALK_CODEX_BIN=$home/slow-codex must_fail slow-codex slow \
+    slow-codex-bar-not-named '^claude-codex: failed (the codex queue call took [0-9.]* s, bar under ' -- \
+    scripts/verify fast --feature claude-codex
+  echo "check: test input: a Claude route bar of 0 s, which every delivery misses"
+  FAKE_CODEX_MODE=reply CREWTALK_VERIFY_CLAUDE_BAR=0 must_fail claude-bar bar \
+    claude-claude-bar-not-named '^claude-claude: failed (the Claude route delivery from .* took [0-9.]* s, bar under 0 s)$' \
+    codex-claude-bar-not-named "^codex-claude: failed (the reply's Claude route delivery took [0-9.]* s, bar under 0 s)$" -- \
+    scripts/verify fast
+  echo "check: test input: a worker whose reply never arrives"
+  FAKE_CODEX_MODE=reply FAKE_CODEX_SILENT_THREAD=$CREWTALK_VERIFY_CODEX_THREAD_2 CREWTALK_VERIFY_TIMEOUT=2 must_fail silent-worker silent \
+    silent-worker-not-named "(codex:$CREWTALK_VERIFY_CODEX_THREAD_2) within 2 s" -- \
+    scripts/verify fast --feature two-projects
+  echo "check: test input: a worker that replies without --reply-to"
+  FAKE_CODEX_MODE=reply CREWTALK_CODEX_BIN=$home/no-reply-to-codex must_fail two-projects-no-reply-to no-reply-to \
+    two-projects-no-reply-to-not-named '^two-projects: failed (the reply from .* does not carry codex:' -- \
+    scripts/verify fast --feature two-projects
+  if [ ! -f "$home/agents.json" ] || grep -qF '"verify-' "$home/agents.json"; then
+    failed+=" verify-row-left"
+  fi
+  echo "check: test input: scripts/verify full without the second thread"
+  code=0
+  env -u CREWTALK_CODEX_BIN -u CREWTALK_VERIFY_CODEX_THREAD_2 scripts/verify full --feature two-projects >"$home/one-thread.out" 2>&1 || code=$?
+  [ "$code" -eq 1 ] || failed+=" one-thread-exit-$code"
+  grep -q '^two-projects: skipped' "$home/one-thread.out" || failed+=" one-thread-not-skipped"
+  echo "check: test input: the same thread twice"
+  code=0
+  CREWTALK_VERIFY_CODEX_THREAD_2=$CREWTALK_VERIFY_CODEX_THREAD scripts/verify fast --feature two-projects >/dev/null 2>&1 || code=$?
+  [ "$code" -eq 64 ] || failed+=" same-thread-exit-$code"
+  echo "check: test input: a stand-in codex that allows crewtalk send and nothing else"
+  FAKE_RULE_OUTPUT='{"matchedRules":[]}' FAKE_RULE_ALLOW=' crewtalk ' PATH=$home/rule:$PATH \
+    env -u CREWTALK_CODEX_BIN scripts/verify full --feature codex-rule >"$home/good-rule.out" 2>&1 || failed+=" good-rule-refused"
+  grep -q '^codex-rule: proven' "$home/good-rule.out" || failed+=" good-rule-not-proven"
+  echo "check: test input: a stand-in codex that answers with no decision"
+  FAKE_RULE_OUTPUT='{"matchedRules":[]}' PATH=$home/rule:$PATH must_fail missing-rule no-rule \
+    missing-rule-not-named '^codex-rule: failed (.* does not allow crewtalk send' -- \
+    env -u CREWTALK_CODEX_BIN scripts/verify full --feature codex-rule
+  echo "check: test input: a stand-in codex that answers allow"
+  FAKE_RULE_OUTPUT='{"matchedRules":[],"decision":"allow"}' PATH=$home/rule:$PATH must_fail broad-rule all-rule \
+    broad-rule-not-named '^codex-rule: failed (.* allows herdr agent prompt' -- \
+    env -u CREWTALK_CODEX_BIN scripts/verify full --feature codex-rule
+  for form in PATH=/x CREWTALK_HOME=/x; do
+    echo "check: test input: a stand-in codex that allows $form crewtalk send"
+    FAKE_RULE_OUTPUT='{"matchedRules":[]}' FAKE_RULE_ALLOW=" crewtalk $form " PATH=$home/rule:$PATH must_fail "$form-rule" env-rule \
+      "$form-rule-not-named" "^codex-rule: failed (.* allows $form crewtalk send" -- \
+      env -u CREWTALK_CODEX_BIN scripts/verify full --feature codex-rule
+  done
+  for out in reply unknown slow bar silent no-reply-to; do
+    ! listener_left "$home/$out.out" || failed+=" wait-left-by-$out"
+  done
+  rm -rf "$home"
+  [ -z "$failed" ] || fail "scripts/verify fast with the fake codex:$failed"
+}
+
+case "$#:${1:-}" in
+  1:-h | 1:--help) usage; exit 0 ;;
+  1:fast | 1:full) mode=$1 ;;
+  *) usage >&2; echo "check usage: exit 64" >&2; exit 64 ;;
+esac
+
+cd "$(dirname "$0")/.."
+unset HERDR_ENV
+trap 'echo "check $mode: exit $?"' EXIT
+"run_$mode"
