@@ -59,7 +59,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		waitForFakeWorkers(root)
+		waitForFakeWorkerLogLines(root)
 		os.RemoveAll(root)
 	})
 	root, err = filepath.EvalSymlinks(root)
@@ -117,9 +117,7 @@ func newFixture(t *testing.T) *fixture {
 	return f
 }
 
-// waitForFakeWorkers lets each fake worker end, because its crewtalk send can
-// still be writing its log line when crew start returns.
-func waitForFakeWorkers(root string) {
+func waitForFakeWorkerLogLines(root string) {
 	lines := func(name string) int {
 		data, _ := os.ReadFile(filepath.Join(root, "herdr", name))
 		return strings.Count(string(data), "\n")
@@ -188,7 +186,7 @@ func crew(t *testing.T, args ...string) result {
 
 func (f *fixture) start(extra ...string) result {
 	f.t.Helper()
-	args := append([]string{"start", "--lead", "lead", "--role", "review", "--deadline", "10m",
+	args := append([]string{"start", "--lead", "lead", "--role", "review",
 		"--folder", f.repo, "--task", "Read the plan."}, extra...)
 	return crew(f.t, args...)
 }
@@ -461,6 +459,9 @@ func TestStartTaskSendResults(t *testing.T) {
 			if row.State != tc.state || !slices.Contains(row.Notes, tc.note) {
 				t.Fatalf("row %+v, want %s with the note %s", row, tc.state, tc.note)
 			}
+			if want := "crew stop " + row.ID + " --force"; !strings.Contains(r.stderr, want) {
+				t.Fatalf("stderr %q does not name %q", r.stderr, want)
+			}
 			if tc.mode == "other" {
 				data, err := os.ReadFile(os.Getenv("FAKE_CODEX_RUNS"))
 				if err != nil || strings.Count(string(data), "run") != 1 {
@@ -478,7 +479,7 @@ func TestStartUnbornHead(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.git(empty, "init", "-q", "-b", "main")
-	r := crew(t, "start", "--lead", "lead", "--role", "review", "--deadline", "10m", "--folder", empty, "--task", "x")
+	r := crew(t, "start", "--lead", "lead", "--role", "review", "--folder", empty, "--task", "x")
 	if r.code != exitFailed {
 		t.Fatalf("exit %d, want %d; stderr %q", r.code, exitFailed, r.stderr)
 	}
@@ -496,7 +497,7 @@ func TestStartRefusesAFolderOutsideGit(t *testing.T) {
 	if err := os.MkdirAll(outside, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	r := crew(t, "start", "--lead", "lead", "--role", "review", "--deadline", "10m", "--folder", outside, "--task", "x")
+	r := crew(t, "start", "--lead", "lead", "--role", "review", "--folder", outside, "--task", "x")
 	if r.code != exitFailed || !strings.Contains(r.stderr, "git repository") {
 		t.Fatalf("exit %d, stderr %q; want %d and a line naming the git repository", r.code, r.stderr, exitFailed)
 	}
@@ -507,7 +508,7 @@ func TestStartRefusesAFolderOutsideGit(t *testing.T) {
 
 func TestStartRefusesALeadNobodyJoined(t *testing.T) {
 	f := newFixture(t)
-	r := crew(t, "start", "--lead", "nobody", "--role", "review", "--deadline", "10m", "--folder", f.repo, "--task", "x")
+	r := crew(t, "start", "--lead", "nobody", "--role", "review", "--folder", f.repo, "--task", "x")
 	if r.code != exitReceiver || !strings.Contains(r.stderr, "crewtalk wait --as nobody") {
 		t.Fatalf("exit %d, stderr %q; want %d and the command to run", r.code, r.stderr, exitReceiver)
 	}
@@ -518,20 +519,16 @@ func TestStartRefusesALeadNobodyJoined(t *testing.T) {
 
 func TestStartUsageErrors(t *testing.T) {
 	f := newFixture(t)
-	base := map[string]string{"--lead": "lead", "--role": "review", "--deadline": "10m", "--folder": f.repo, "--task": "x"}
+	base := map[string]string{"--lead": "lead", "--role": "review", "--folder": f.repo, "--task": "x"}
 	for name, change := range map[string]map[string]string{
 		"no lead":          {"--lead": ""},
 		"no role":          {"--role": ""},
 		"role with space":  {"--role": "a b"},
 		"role too long":    {"--role": strings.Repeat("a", 27)},
-		"no deadline":      {"--deadline": ""},
-		"bad deadline":     {"--deadline": "soon"},
-		"zero deadline":    {"--deadline": "0s"},
 		"no folder":        {"--folder": ""},
 		"no task":          {"--task": ""},
 		"model is a flag":  {"--model": "--dangerously-bypass-approvals-and-sandbox"},
 		"effort is a key":  {"--effort": "high -c sandbox_mode=danger-full-access"},
-		"lead is a flag":   {"--lead": "--help-me"},
 		"role is reserved": {"--role": "crew-ready"},
 		"task too long":    {"--task": strings.Repeat("x", maxTaskBytes+1)},
 	} {
@@ -558,7 +555,7 @@ func TestStartUsageErrors(t *testing.T) {
 		})
 	}
 	t.Run("both task forms", func(t *testing.T) {
-		r := crew(t, "start", "--lead", "lead", "--role", "review", "--deadline", "10m", "--folder", f.repo, "--task", "x", "--task-file", "y")
+		r := crew(t, "start", "--lead", "lead", "--role", "review", "--folder", f.repo, "--task", "x", "--task-file", "y")
 		if r.code != exitUsage {
 			t.Fatalf("exit %d, want %d", r.code, exitUsage)
 		}
@@ -974,25 +971,37 @@ func TestHerdrCallsAreListed(t *testing.T) {
 	id, _ := f.mustStart()
 	t.Setenv("FAKE_HERDR_STATUS", "working")
 	crew(t, "stop", id, "--force")
-	allowed := []string{"tab create", "tab close", "pane get", "pane read", "pane close", "pane layout",
-		"agent start", "agent get", "agent list", "notification show"}
-	calls := f.herdrCalls()
-	if len(calls) == 0 {
-		t.Fatal("no herdr calls recorded")
+	listed, err := exec.Command("herdr", "--allowed").Output()
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, call := range calls {
-		if len(call) < 2 || !slices.Contains(allowed, call[0]+" "+call[1]) {
-			t.Fatalf("herdr call %q is not on the allowed list", call)
+	allowed := strings.Split(strings.TrimSpace(string(listed)), "\n")
+	var used []string
+	for _, call := range f.herdrCalls() {
+		if len(call) < 2 {
+			t.Fatalf("herdr call %q", call)
+		}
+		used = append(used, call[0]+" "+call[1])
+	}
+	for _, command := range used {
+		if !slices.Contains(allowed, command) {
+			t.Fatalf("crew ran %q, which is not on the allowed list", command)
 		}
 	}
-	refused := exec.Command("herdr", "pane", "send-keys", "w:p1", "1")
-	err := refused.Run()
+	for _, command := range allowed {
+		if !slices.Contains(used, command) {
+			t.Fatalf("the allowed list holds %q, which crew did not run", command)
+		}
+	}
+	err = exec.Command("herdr", "pane", "send-keys", "w:p1", "1").Run()
 	if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 99 {
 		t.Fatalf("the fake ran a command outside the list: %v", err)
 	}
 }
 
-func TestCrewImportsOnlyState(t *testing.T) {
+func TestCrewImportsOnlyItsPackages(t *testing.T) {
+	const module = "github.com/amrendra18/crewtalk/internal/"
+	allowed := []string{module + "book", module + "message", module + "notice", module + "state"}
 	files, err := filepath.Glob("*.go")
 	if err != nil {
 		t.Fatal(err)
@@ -1009,7 +1018,7 @@ func TestCrewImportsOnlyState(t *testing.T) {
 		for _, spec := range parsed.Imports {
 			path := strings.Trim(spec.Path.Value, `"`)
 			first, _, _ := strings.Cut(path, "/")
-			if strings.Contains(first, ".") && path != "github.com/amrendra18/crewtalk/internal/state" {
+			if strings.Contains(first, ".") && !slices.Contains(allowed, path) {
 				t.Fatalf("%s imports %s", name, path)
 			}
 		}
@@ -1026,5 +1035,11 @@ func TestUsage(t *testing.T) {
 	r := crew(t, "--help")
 	if r.code != exitOK || !strings.Contains(r.stdout, "crew start") || !strings.Contains(r.stdout, "crew stop") {
 		t.Fatalf("--help: exit %d, stdout %q", r.code, r.stdout)
+	}
+	if want := "does not start with ="; !strings.Contains(r.stdout, want) {
+		t.Fatalf("--help does not state the --lead rule %q: %q", want, r.stdout)
+	}
+	if want := "CREW_START_WAIT"; !strings.Contains(r.stdout, want) || !strings.Contains(r.stdout, startWait.String()) {
+		t.Fatalf("--help does not name %s and its default %s: %q", want, startWait, r.stdout)
 	}
 }

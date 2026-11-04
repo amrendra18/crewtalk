@@ -358,7 +358,7 @@ func TestStartRefusesAHugeTaskFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strings.Repeat("x", 3_000_000)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	r := crew(t, "start", "--lead", "lead", "--role", "review", "--deadline", "10m", "--folder", f.repo, "--task-file", path)
+	r := crew(t, "start", "--lead", "lead", "--role", "review", "--folder", f.repo, "--task-file", path)
 	if r.code != exitUsage {
 		t.Fatalf("exit %d, want %d; stderr %q", r.code, exitUsage, r.stderr[:min(len(r.stderr), 200)])
 	}
@@ -377,10 +377,10 @@ func TestStartSendThatNeverRanIsNotSent(t *testing.T) {
 	t.Setenv("PATH", f.binDir)
 	var stdout, stderr strings.Builder
 	s := starter{o: startOptions{lead: "lead", task: "x"}, home: f.crewHome, row: row, stdout: &stdout, stderr: &stderr}
-	if err := saveWorker(f.crewHome, &s.row, func(w *worker) { w.State, w.Notes = "starting", []string{} }); err != nil {
+	if err := applyToRow(f.crewHome, &s.row, func(w *worker) { w.State, w.Notes = "starting", []string{} }); err != nil {
 		t.Fatal(err)
 	}
-	if code := s.sendTask(); code != exitFailed {
+	if code := s.sendTaskOnce(); code != exitFailed {
 		t.Fatalf("exit %d, want %d; stderr %q", code, exitFailed, stderr.String())
 	}
 	got := f.row(id)
@@ -419,7 +419,7 @@ func TestNameCollisionWithARow(t *testing.T) {
 	if first != "review-aaaa" {
 		t.Fatalf("first id %s", first)
 	}
-	r := crew(t, "start", "--lead", "lead", "--role", "other", "--deadline", "10m", "--folder", f.repo, "--task", "x")
+	r := crew(t, "start", "--lead", "lead", "--role", "other", "--folder", f.repo, "--task", "x")
 	if id, _ := r.json["id"].(string); r.code != exitOK || id != "other-bbbb" {
 		t.Fatalf("exit %d, id %q, stderr %q; want other-bbbb, because the ready name crew-ready-aaaa is taken", r.code, id, r.stderr)
 	}
@@ -442,12 +442,49 @@ func TestNameCollisionGivesUp(t *testing.T) {
 	}
 }
 
+func TestPrintJSONEscapesControls(t *testing.T) {
+	var out strings.Builder
+	printJSON(&out, map[string]string{"folder": "a\u009bb"})
+	if strings.Contains(out.String(), "\u009b") || !strings.Contains(out.String(), `\u009b`) {
+		t.Fatalf("printJSON printed %q", out.String())
+	}
+}
+
+func TestPrintableKeepsTextOfInvalidBytes(t *testing.T) {
+	got := printable(strings.Repeat("\x80", 1000))
+	if !strings.HasPrefix(got, `\x80\x80`) || !strings.HasSuffix(got, "...") {
+		t.Fatalf("printable kept %q", got[:min(len(got), 40)])
+	}
+}
+
+func TestShellQuoteQuotesALeadingEquals(t *testing.T) {
+	if got := shellQuote("=lead"); got != "'=lead'" {
+		t.Fatalf("shellQuote(=lead) = %q", got)
+	}
+	if got := shellQuote("a=b"); got != "a=b" {
+		t.Fatalf("shellQuote(a=b) = %q", got)
+	}
+}
+
+func TestPrintableKeepsEscapesWhole(t *testing.T) {
+	for pad := 390; pad < 402; pad++ {
+		got := printable(strings.Repeat("x", pad) + strings.Repeat("\x1b", 20))
+		tail := strings.TrimSuffix(got, "...")
+		if tail == got {
+			t.Fatalf("pad %d: a long text has no mark that it was cut: %q", pad, got)
+		}
+		if i := strings.LastIndex(tail, `\`); i >= 0 && len(tail)-i != len(`\x1b`) {
+			t.Fatalf("pad %d: the text ends in a cut escape: %q", pad, got[max(0, len(got)-12):])
+		}
+	}
+}
+
 func TestPrintable(t *testing.T) {
 	for in, want := range map[string]string{
 		"plain":             "plain",
-		"a\x1b[31mb":        "a [31mb",
-		"one\ntwo\r\tthree": "one two  three",
-		"\u009b31m":         "31m",
+		"a\x1b[31mb":        `a\x1b[31mb`,
+		"one\ntwo\r\tthree": `one two\x0d three`,
+		"\u009b31m":         `\u009b31m`,
 		"caf\u00e9":         "caf\u00e9",
 	} {
 		if got := printable(in); got != want {
@@ -459,8 +496,8 @@ func TestPrintable(t *testing.T) {
 		t.Errorf("a long text became %q", long)
 	}
 	r := toolResult{stderr: `{"error":{"code":"x","message":"bad` + "\\u001b" + `[31m"}}`}
-	if got := r.detail(); strings.ContainsRune(got, 0x1b) {
-		t.Errorf("detail() kept a control character: %q", got)
+	if got := r.detail(); strings.ContainsRune(got, 0x1b) || !strings.Contains(got, `\x1b`) {
+		t.Errorf("detail() did not show the control character as an escape: %q", got)
 	}
 }
 

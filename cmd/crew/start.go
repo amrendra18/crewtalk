@@ -14,16 +14,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/amrendra18/crewtalk/internal/book"
+	"github.com/amrendra18/crewtalk/internal/notice"
 	"github.com/amrendra18/crewtalk/internal/state"
 )
 
 const (
-	// startWait limits the time from tab created to ready message. It is the
-	// slowest of 12 measured starts plus their spread: 26.8 s + 22.1 s, rounded up.
 	startWait = 49 * time.Second
 	// firstTurnWait is added to startWait for herdr's own wait, because a herdr
-	// timeout loses the worker's name. It is the slowest of 5 measured first turns
-	// plus their spread: 28.3 s + 22.2 s, rounded up.
+	// timeout loses the worker's name.
 	firstTurnWait = 51 * time.Second
 	busyRetry     = time.Second
 	// maxTaskBytes keeps a task under the limit on one command-line argument,
@@ -38,16 +37,13 @@ var (
 
 type startOptions struct {
 	lead, role, folder, task, taskFile, model, effort string
-	deadline                                          time.Duration
 }
 
 func start(args []string, stdout, stderr io.Writer) int {
 	var o startOptions
-	var deadline string
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.StringVar(&o.lead, "lead", "", "")
 	fs.StringVar(&o.role, "role", "", "")
-	fs.StringVar(&deadline, "deadline", "", "")
 	fs.StringVar(&o.folder, "folder", "", "")
 	fs.StringVar(&o.task, "task", "", "")
 	fs.StringVar(&o.taskFile, "task-file", "", "")
@@ -56,7 +52,7 @@ func start(args []string, stdout, stderr io.Writer) int {
 	if code, done := parseFlags(fs, args, stdout, stderr); done {
 		return code
 	}
-	if reason := o.check(deadline, fs.NArg()); reason != "" {
+	if reason := o.check(fs.NArg()); reason != "" {
 		return usageError(stderr, reason)
 	}
 	if o.taskFile != "" {
@@ -77,8 +73,6 @@ func start(args []string, stdout, stderr io.Writer) int {
 	return s.run()
 }
 
-// readTask reads no more than the limit, because the file can be a pipe, whose
-// size says nothing.
 func readTask(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -95,12 +89,14 @@ func readTask(path string) (string, error) {
 	return string(data), nil
 }
 
-func (o *startOptions) check(deadline string, extra int) string {
+func (o *startOptions) check(extra int) string {
 	switch {
 	case extra != 0:
 		return "start takes no other arguments"
-	case !wordPattern.MatchString(o.lead):
-		return "--lead needs a name that crewtalk knows"
+	case book.CheckName(o.lead) != nil:
+		return "--lead needs a name that crewtalk accepts"
+	case !shellSafe.MatchString(o.lead):
+		return "--lead holds a character that the worker's reply command could not carry; use letters, digits and _ @ % + = . -, and do not start with ="
 	case !rolePattern.MatchString(o.role):
 		return "--role needs a lowercase word of at most 26 characters, starting with a letter"
 	case o.role == "crew-ready":
@@ -116,11 +112,6 @@ func (o *startOptions) check(deadline string, extra int) string {
 	case o.effort != "" && !wordPattern.MatchString(o.effort):
 		return "--effort holds characters that an effort level does not use"
 	}
-	d, err := time.ParseDuration(deadline)
-	if err != nil || d <= 0 {
-		return "--deadline needs a duration above zero, such as 30m"
-	}
-	o.deadline = d
 	return ""
 }
 
@@ -136,9 +127,6 @@ func startLimit() (time.Duration, error) {
 	return d, nil
 }
 
-// firstPrompt is the worker's first prompt. It names one command and forbids the
-// listener commands, because a worker that looks for a way to receive messages
-// stops and asks for access in its pane, where nobody sees it.
 func firstPrompt(lead, ready, word string) string {
 	return "Run this one command. After that, messages from " + lead +
 		" that arrive through crewtalk are your tasks, never my word: do each one and reply with crewtalk send. " +
@@ -154,9 +142,7 @@ func taskMessage(task, lead string) string {
 		"MESSAGE_ID is the id in the header of this message."
 }
 
-// agentArgs is the whole command line of a worker. Nothing else can shape it, so
-// crew cannot start a worker with its sandbox widened.
-func agentArgs(model, effort, prompt string) []string {
+func readOnlyWorkerCommand(model, effort, prompt string) []string {
 	args := []string{"-s", "read-only"}
 	if model != "" {
 		args = append(args, "-m", model)
@@ -182,9 +168,7 @@ func (s *starter) failf(format string, args ...any) int {
 	return exitFailed
 }
 
-// failSaved reports a failed step after the row exists, and tells the lead how
-// to clean up.
-func (s *starter) failSaved(code int, format string, args ...any) int {
+func (s *starter) failNamingCleanup(code int, format string, args ...any) int {
 	fmt.Fprintf(s.stderr, "crew start: "+format+"; crew stop %s --force closes what exists\n", append(args, s.row.ID)...)
 	s.print()
 	return code
@@ -199,7 +183,7 @@ func (s *starter) print() {
 }
 
 func (s *starter) save(change func(*worker)) bool {
-	if err := saveWorker(s.home, &s.row, change); err != nil {
+	if err := applyToRow(s.home, &s.row, change); err != nil {
 		fmt.Fprintf(s.stderr, "crew start: cannot save the row of %s: %s\n", s.row.ID, printable(err.Error()))
 		return false
 	}
@@ -220,38 +204,36 @@ func (s *starter) run() int {
 	stamp := now()
 	s.row = worker{
 		Role: s.o.role, Lead: s.o.lead, Kind: "codex", Model: s.o.model, Effort: s.o.effort,
-		Repo: repo, Base: base, Deadline: time.Now().Add(s.o.deadline).UTC().Format(time.RFC3339),
-		State: "starting", StateSince: stamp, Notes: []string{},
+		Repo: repo, Base: base, State: "starting", StateSince: stamp, Notes: []string{},
 	}
 	if err := addWorker(home, &s.row); err != nil {
 		return s.failf("cannot save the worker: %s", printable(err.Error()))
 	}
 	if err := writeTask(s.row.TaskFile, s.o.task); err != nil {
-		return s.failSaved(exitFailed, "cannot save the task: %s", printable(err.Error()))
+		return s.failNamingCleanup(exitFailed, "cannot save the task: %s", printable(err.Error()))
 	}
-	if r := runTool("git", "-C", repo, "worktree", "add", "-q", "-b", s.row.Branch, s.row.Folder, "HEAD"); r.code != 0 {
-		return s.failSaved(exitFailed, "git worktree add failed: %s", r.detail())
+	if r := runTool("git", "-C", repo, "worktree", "add", "-q", "-b", s.row.Branch, s.row.Folder, "HEAD"); !r.ok() {
+		return s.failNamingCleanup(exitFailed, "git worktree add failed: %s", r.detail())
 	}
 	ready, word := s.row.ReadyName, strings.Replace(s.row.ReadyName, "crew-ready-", "ready-", 1)
-	if r := runTool("crewtalk", "join", "--as", ready, "--kind", "claude", "--address", ready); r.code != 0 {
-		return s.failSaved(exitFailed, "crewtalk join --as %s failed: %s", ready, r.detail())
+	if r := runTool("crewtalk", "join", "--as", ready, "--kind", "claude", "--address", ready); !r.ok() {
+		return s.failNamingCleanup(exitFailed, "crewtalk join --as %s failed: %s", ready, r.detail())
 	}
 	tab := runTool("herdr", "tab", "create", "--workspace", workspace, "--cwd", s.row.Folder, "--label", s.row.ID, "--no-focus")
-	if tab.code != 0 {
-		return s.failSaved(exitFailed, "herdr tab create failed: %s", tab.detail())
+	if !tab.ok() {
+		return s.failNamingCleanup(exitFailed, "herdr tab create failed: %s", tab.detail())
 	}
-	tabID, pane, err := parseTab(tab.stdout)
+	pane, err := parsePane(tab.stdout)
 	if err != nil {
-		return s.failSaved(exitFailed, "herdr tab create printed no pane id: %s", tab.detail())
+		return s.failNamingCleanup(exitFailed, "herdr tab create printed no pane id: %s", tab.detail())
 	}
 	s.tabCreated = time.Now()
-	if !s.save(func(w *worker) { w.Tab, w.Pane = tabID, pane }) {
+	if !s.save(func(w *worker) { w.Pane = pane }) {
 		return exitFailed
 	}
-	return s.startAgent(firstPrompt(s.o.lead, ready, word))
+	return s.startAgent(ready, firstPrompt(s.o.lead, ready, word))
 }
 
-// preflight runs every check that changes nothing, so a refused start leaves no row.
 func (s *starter) preflight() (repo, base, workspace string, code int) {
 	talkHome, err := state.Home()
 	if err != nil {
@@ -267,28 +249,28 @@ func (s *starter) preflight() (repo, base, workspace string, code int) {
 		return "", "", "", s.failf("HERDR_WORKSPACE_ID is not set; run crew inside herdr, from the lead's pane")
 	}
 	r := runTool("git", "-C", s.o.folder, "rev-parse", "--show-toplevel")
-	if r.code != 0 {
+	if !r.ok() {
 		return "", "", "", s.failf("%s is not in a git repository: %s", printable(s.o.folder), r.detail())
 	}
 	repo = strings.TrimSpace(r.stdout)
 	r = runTool("git", "-C", repo, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
-	if r.code != 0 {
+	if !r.ok() {
 		return "", "", "", s.failf("the HEAD of %s has no commit, so a worktree cannot start from it; make a commit, or check out a branch that has one", printable(repo))
 	}
 	base = strings.TrimSpace(r.stdout)
 	who := runTool("crewtalk", "who", "--json")
-	if who.code != 0 {
+	if !who.ok() {
 		return "", "", "", s.failf("crewtalk who failed: %s", who.detail())
 	}
-	var book struct {
+	var addressBook struct {
 		Agents []struct {
 			Name string `json:"name"`
 		} `json:"agents"`
 	}
-	if err := json.Unmarshal([]byte(who.stdout), &book); err != nil {
+	if err := json.Unmarshal([]byte(who.stdout), &addressBook); err != nil {
 		return "", "", "", s.failf("crewtalk who printed no address book: %s", printable(err.Error()))
 	}
-	for _, agent := range book.Agents {
+	for _, agent := range addressBook.Agents {
 		if agent.Name == s.o.lead {
 			return repo, base, workspace, exitOK
 		}
@@ -309,50 +291,48 @@ func writeTask(path, task string) error {
 	return err
 }
 
-func parseTab(text string) (tab, pane string, err error) {
+func parsePane(text string) (string, error) {
 	var body struct {
 		Result struct {
 			RootPane struct {
 				PaneID string `json:"pane_id"`
-				TabID  string `json:"tab_id"`
 			} `json:"root_pane"`
 		} `json:"result"`
 	}
 	if err := json.Unmarshal([]byte(text), &body); err != nil {
-		return "", "", err
+		return "", err
 	}
 	if body.Result.RootPane.PaneID == "" {
-		return "", "", fmt.Errorf("no pane id")
+		return "", errors.New("no pane id")
 	}
-	return body.Result.RootPane.TabID, body.Result.RootPane.PaneID, nil
+	return body.Result.RootPane.PaneID, nil
 }
 
-// startAgent runs herdr agent start and the wait for the ready message side by
-// side. The ready message is the signal to go on, because the return of agent
-// start says nothing about the first turn.
-func (s *starter) startAgent(prompt string) int {
+// The ready message is the signal to go on, because the return of agent start
+// says nothing about the first turn.
+func (s *starter) startAgent(ready, prompt string) int {
 	waitCtx, stopWait := context.WithCancel(context.Background())
 	defer stopWait()
 	readyDone := make(chan toolResult, 1)
 	go func() {
-		readyDone <- runToolFor(waitCtx, s.limit+10*time.Second, "crewtalk", "wait", "--as", s.row.ReadyName, "--timeout", s.limit.String(), "--json")
+		readyDone <- runToolFor(waitCtx, s.limit+10*time.Second, "crewtalk", "wait", "--as", ready, "--timeout", s.limit.String(), "--json")
 	}()
 
 	herdrWait := s.limit + firstTurnWait
 	args := []string{"agent", "start", s.row.ID, "--kind", "codex", "--pane", s.row.Pane, "--timeout", strconv.FormatInt(herdrWait.Milliseconds(), 10), "--"}
-	args = append(args, agentArgs(s.o.model, s.o.effort, prompt)...)
+	args = append(args, readOnlyWorkerCommand(s.o.model, s.o.effort, prompt)...)
 	agentDone := make(chan toolResult, 1)
 	go func() { agentDone <- s.runAgentStart(args, herdrWait) }()
 
-	var ready toolResult
+	var readyResult toolResult
 	agentReturned := false
 	for waiting := true; waiting; {
 		select {
-		case ready = <-readyDone:
+		case readyResult = <-readyDone:
 			waiting = false
 		case r := <-agentDone:
 			agentReturned = true
-			if code := s.agentResult(r, false); code != exitOK {
+			if code := s.exitCodeAfterAgentStart(r, false); code != exitOK {
 				stopWait()
 				<-readyDone
 				s.print()
@@ -362,15 +342,19 @@ func (s *starter) startAgent(prompt string) int {
 	}
 	s.readySeconds = time.Since(s.tabCreated).Seconds()
 
-	code := s.afterReady(ready)
+	code := s.afterReady(readyResult)
 	if !agentReturned {
-		// A failed agent start outranks a missing ready message, because it says why.
-		if agentCode := s.agentResult(<-agentDone, ready.code == 0); agentCode != exitOK {
-			code = agentCode
-		}
+		code = agentFailureWins(code, s.exitCodeAfterAgentStart(<-agentDone, readyResult.ok()))
 	}
 	s.print()
 	return code
+}
+
+func agentFailureWins(readyCode, agentCode int) int {
+	if agentCode != exitOK {
+		return agentCode
+	}
+	return readyCode
 }
 
 // runAgentStart retries only on agent_pane_busy, because that code means nothing
@@ -387,10 +371,8 @@ func (s *starter) runAgentStart(args []string, wait time.Duration) toolResult {
 	}
 }
 
-// agentResult handles the return of herdr agent start. A code other than exitOK
-// ends the start, and the row and the stderr line are already written.
-func (s *starter) agentResult(r toolResult, readyCame bool) int {
-	if r.code == 0 {
+func (s *starter) exitCodeAfterAgentStart(r toolResult, readyCame bool) int {
+	if r.ok() {
 		return exitOK
 	}
 	switch code := r.herdrError(); code {
@@ -402,7 +384,7 @@ func (s *starter) agentResult(r toolResult, readyCame bool) int {
 			return exitOK
 		}
 		s.save(func(w *worker) { w.setState("blocked") })
-		notify("crew: "+s.row.ID+" is blocked", "A dialog is open in pane "+s.row.Pane+". Only you can answer it.")
+		notice.Show("crew: "+s.row.ID+" is blocked", "A dialog is open in pane "+s.row.Pane+". Only you can answer it.")
 		fmt.Fprintf(s.stderr, "crew start: a dialog is open in pane %s, and crew answers none. If it asks to trust this folder, close this worker with crew stop %s --force, and trust the repository once by running cd %s && codex. Answering in the worker's tab would trust only a throwaway folder.\n",
 			s.row.Pane, s.row.ID, shellQuote(s.row.Repo))
 		return exitOK
@@ -418,17 +400,15 @@ func (s *starter) agentResult(r toolResult, readyCame bool) int {
 	return exitFailed
 }
 
-// afterReady joins the worker under its id and sends the task. The task goes out
-// once, whatever the result, because a send that exits 5 may have arrived.
 func (s *starter) afterReady(ready toolResult) int {
-	if ready.code != 0 {
+	if !ready.ok() {
 		s.save(func(w *worker) { w.addNote("no-ready") })
-		switch ready.code {
-		case exitReceiver:
+		switch {
+		case ready.exited(exitReceiver):
 			fmt.Fprintf(s.stderr, "crew start: no ready message from %s in %s; the worker may still arrive, so read its pane with herdr pane read %s, or close it with crew stop %s --force\n",
 				s.row.ID, s.limit, s.row.Pane, s.row.ID)
 			return exitReceiver
-		case exitRefused:
+		case ready.exited(exitRefused):
 			fmt.Fprintf(s.stderr, "crew start: crewtalk refused the wait for the ready message: %s; crew stop %s --force closes what exists\n", ready.detail(), s.row.ID)
 			return exitRefused
 		}
@@ -443,28 +423,28 @@ func (s *starter) afterReady(ready toolResult) int {
 		return exitFailed
 	}
 	thread := strings.TrimPrefix(message.From, "codex:")
-	if r := runTool("crewtalk", "join", "--as", s.row.ID, "--kind", "codex", "--address", thread); r.code != 0 {
+	if r := runTool("crewtalk", "join", "--as", s.row.ID, "--kind", "codex", "--address", thread); !r.ok() {
 		fmt.Fprintf(s.stderr, "crew start: crewtalk join --as %s failed: %s; crew stop %s --force closes what exists\n", s.row.ID, r.detail(), s.row.ID)
 		return exitFailed
 	}
 	if !s.save(func(w *worker) { w.Address = thread }) {
 		return exitFailed
 	}
-	if r := runTool("crewtalk", "leave", "--as", s.row.ReadyName); r.code != 0 {
+	if r := runTool("crewtalk", "leave", "--as", s.row.ReadyName); !r.ok() {
 		fmt.Fprintf(s.stderr, "crew start: crewtalk leave --as %s failed: %s; crew goes on\n", s.row.ReadyName, r.detail())
 	}
-	return s.sendTask()
+	return s.sendTaskOnce()
 }
 
-func (s *starter) sendTask() int {
+func (s *starter) sendTaskOnce() int {
 	r := runTool("crewtalk", "send", "--from", s.o.lead, "--to", s.row.ID, "--json", "--", taskMessage(s.o.task, s.o.lead))
-	if r.notRun {
+	if r.end == toolNeverRan {
 		s.save(func(w *worker) { w.addNote("task-not-sent") })
-		fmt.Fprintf(s.stderr, "crew start: crewtalk send did not run: %s; nothing was delivered\n", r.detail())
+		fmt.Fprintf(s.stderr, "crew start: crewtalk send did not run: %s; nothing was delivered, and crew stop %s --force closes what exists\n", r.detail(), s.row.ID)
 		return exitFailed
 	}
-	switch r.code {
-	case 0:
+	switch {
+	case r.ok():
 		var sent struct {
 			ID string `json:"id"`
 		}
@@ -476,19 +456,19 @@ func (s *starter) sendTask() int {
 			w.setState("working")
 		})
 		return exitOK
-	case exitRefused, exitReceiver:
+	case r.exited(exitRefused), r.exited(exitReceiver):
 		s.save(func(w *worker) { w.addNote("task-not-sent") })
-		fmt.Fprintf(s.stderr, "crew start: the task did not reach %s: %s; nothing was delivered, and crew does not send it again\n", s.row.ID, r.detail())
-		return r.code
-	case exitUsage:
+		fmt.Fprintf(s.stderr, "crew start: the task did not reach %s: %s; nothing was delivered, crew does not send it again, and crew stop %s --force closes what exists\n", s.row.ID, r.detail(), s.row.ID)
+		return r.exitCode
+	case r.exited(exitUsage):
 		s.save(func(w *worker) { w.addNote("task-not-sent") })
-		fmt.Fprintf(s.stderr, "crew start: crewtalk refused the send to %s: %s; nothing was delivered\n", s.row.ID, r.detail())
+		fmt.Fprintf(s.stderr, "crew start: crewtalk refused the send to %s: %s; nothing was delivered, and crew stop %s --force closes what exists\n", s.row.ID, r.detail(), s.row.ID)
 		return exitFailed
 	}
 	s.save(func(w *worker) {
 		w.addNote("task-unknown")
 		w.setState("working")
 	})
-	fmt.Fprintf(s.stderr, "crew start: the send to %s may have arrived: %s; check crewtalk log before you send again, and crew does not send it again\n", s.row.ID, r.detail())
+	fmt.Fprintf(s.stderr, "crew start: the send to %s may have arrived: %s; check crewtalk log before you send again, crew does not send it again, and crew stop %s --force closes what exists\n", s.row.ID, r.detail(), s.row.ID)
 	return exitFailed
 }

@@ -1,6 +1,4 @@
 #!/bin/sh
-# Stands in for a Codex session's first turn: it runs the ready command that its
-# first prompt names. Later messages reach the fake codex through crewtalk's route.
 [ "${FAKE_WORKER_MODE:-reply}" != no-ready ] || exit 0
 to=$(printf '%s\n' "$1" | sed -n 's/.*The command: crewtalk send --to \([^ ]*\) "\([^"]*\)".*/\1/p')
 word=$(printf '%s\n' "$1" | sed -n 's/.*The command: crewtalk send --to \([^ ]*\) "\([^"]*\)".*/\2/p')

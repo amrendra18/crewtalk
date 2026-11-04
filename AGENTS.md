@@ -134,6 +134,28 @@ Each invariant names its tests.
     ids. Test: the `scripts/verify` journey `two-projects` for threads and turns;
     `journey-two-workers`, by hand, in `verify/hand-journey.md`, for "at once".
 
+15. `crew stop` never loses work. It removes a worker's folder only when git shows
+    no change and no ignored file there, no git operation is in progress there, and
+    its HEAD is on the worker's branch. It deletes the branch only with
+    `git branch -d`. When crew is not sure, it keeps them and says so, and `--force`
+    does not widen what gets deleted. It does not check history: a commit that no
+    branch or tag holds is gone with the folder. Test: `TestStopKeeps*` and
+    `TestStopRunsOnlyPlainGitRemoval` in `cmd/crew`; the `scripts/verify` journey
+    `crew-dirty-stop`.
+16. A crew worker is read-only. `crew start` runs Codex with `-s read-only` and no
+    approval or bypass flag, and only `--model` and `--effort` shape the command,
+    each checked so that its value cannot add a flag. A worker can still ask to
+    leave the sandbox. Codex's own approval review decides that, and crew cannot see
+    it. Test: `TestStartAgentCommand` and `TestStartUsageErrors` in `cmd/crew`.
+17. `crew stop` closes only the pane that its row recorded, and never answers a
+    dialog. It closes nothing when herdr cannot be read, when the worker moved to
+    another pane, or when herdr names another agent in that pane, also with
+    `--force`. herdr can have no name for an agent, and then the recorded pane closes.
+    Test: `TestStopRefusesAnotherAgentInPane`, `TestStopRefusesAMovedPane`,
+    `TestStopHerdrUnreadableChangesNothing`, `TestStopFailedAgentReadChangesNothing`,
+    `TestStopAgentWithNoNameGoesOn`, `TestStartDialogMessage` and
+    `TestHerdrCallsAreListed` in `cmd/crew`.
+
 ## Verification
 
 - Run focused tests and the project's full check before you open a pull

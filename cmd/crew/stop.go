@@ -11,10 +11,23 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"github.com/amrendra18/crewtalk/internal/notice"
+)
+
+type paneKind int
+
+const (
+	paneHasWorker paneKind = iota
+	paneHasNoAgent
+	paneGone
+	paneMoved
+	paneHasOtherAgent
+	paneUnreadable
 )
 
 type paneRead struct {
-	kind   string // "agent", "none", "gone", "moved", "other" or "unreadable"
+	kind   paneKind
 	status string
 	moved  string
 	other  string
@@ -59,46 +72,50 @@ func stop(args []string, stdout, stderr io.Writer) int {
 		return finishStop(home, &row, stdout, stderr)
 	}
 
-	read := paneRead{kind: "gone"}
+	read := paneRead{kind: paneGone}
 	if row.Pane != "" {
 		read = readPane(row)
 	}
 	switch {
-	case read.kind == "unreadable":
-		if err := saveWorker(home, &row, func(w *worker) { w.addNote("herdr-unreadable") }); err != nil {
+	case read.kind == paneUnreadable:
+		if err := applyToRow(home, &row, func(w *worker) { w.addNote("herdr-unreadable") }); err != nil {
 			fmt.Fprintf(stderr, "crew stop: cannot save the row: %s\n", printable(err.Error()))
 		}
 		fmt.Fprintf(stderr, "crew stop: cannot read pane %s, so nothing was closed: %s; run crew stop again when herdr answers\n", row.Pane, read.detail)
 		return exitFailed
-	case read.kind == "moved":
+	case read.kind == paneMoved:
 		fmt.Fprintf(stderr, "crew stop: worker %s moved from pane %s to pane %s, so nothing was closed; close pane %s yourself, then run crew stop again\n", row.ID, row.Pane, read.moved, read.moved)
 		return exitFailed
-	case read.kind == "other":
+	case read.kind == paneHasOtherAgent:
 		fmt.Fprintf(stderr, "crew stop: pane %s holds the agent %s, which is not worker %s, so nothing was closed, and --force does not change this; close that agent or the pane, then run crew stop again\n", row.Pane, read.other, row.ID)
 		return exitFailed
-	case read.kind == "agent" && read.status != "idle" && read.status != "done" && !force:
+	case read.kind == paneHasWorker && read.status != "idle" && read.status != "done" && !force:
 		fmt.Fprintf(stderr, "crew stop: herdr reads %s as %s, so nothing was closed; wait for it, or use --force to close it\n", row.ID, read.status)
 		return exitFailed
 	}
 
 	if force {
-		if err := saveWorker(home, &row, func(w *worker) {
+		if err := applyToRow(home, &row, func(w *worker) {
 			w.ForcedAt = now()
 			w.addNote("forced")
 		}); err != nil {
 			fmt.Fprintf(stderr, "crew stop: cannot save the row: %s\n", printable(err.Error()))
 			return exitFailed
 		}
-		notify("crew: "+row.ID+" was force-stopped", "crew stop --force closed pane "+row.Pane+".")
 	}
-	if read.kind != "gone" {
-		if r := runTool("herdr", "pane", "close", row.Pane); r.code != 0 {
+	forceNotice := "crew stop --force found no open pane for this worker."
+	if read.kind != paneGone {
+		if r := runTool("herdr", "pane", "close", row.Pane); !r.ok() {
 			fmt.Fprintf(stderr, "crew stop: herdr pane close %s failed: %s; run crew stop again\n", row.Pane, r.detail())
 			return exitFailed
 		}
+		forceNotice = "crew stop --force closed pane " + row.Pane + "."
+	}
+	if force {
+		notice.Show("crew: "+row.ID+" was force-stopped", forceNotice)
 	}
 	for _, name := range []string{row.ID, row.ReadyName} {
-		if r := runTool("crewtalk", "leave", "--as", name); r.code != 0 && r.code != exitReceiver {
+		if r := runTool("crewtalk", "leave", "--as", name); !r.ok() && !r.exited(exitReceiver) {
 			fmt.Fprintf(stderr, "crew stop: crewtalk leave --as %s failed: %s; run crew stop again\n", name, r.detail())
 			return exitFailed
 		}
@@ -106,8 +123,6 @@ func stop(args []string, stdout, stderr io.Writer) int {
 	return finishStop(home, &row, stdout, stderr)
 }
 
-// finishStop deals with the folder and the branch. A second crew stop comes here
-// too, so it removes a folder that is now clean, or prints the kept line again.
 func finishStop(home string, row *worker, stdout, stderr io.Writer) int {
 	folderKept, paths := keepOrRemoveFolder(*row, stderr)
 	branchKept := folderKept
@@ -123,7 +138,7 @@ func finishStop(home string, row *worker, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "crew stop: a crewtalk wait still runs for this worker, and crew sends it no signal: %s\n", printable(line))
 	}
 
-	if err := saveWorker(home, row, func(w *worker) {
+	if err := applyToRow(home, row, func(w *worker) {
 		w.FolderKept = folderKept
 		w.setState("stopped")
 	}); err != nil {
@@ -137,44 +152,42 @@ func finishStop(home string, row *worker, stdout, stderr io.Writer) int {
 	return exitOK
 }
 
-// readPane reads the recorded pane. A failed read is unreadable, which never
-// means idle and never means gone, so it closes nothing.
 func readPane(row worker) paneRead {
 	pane := runTool("herdr", "pane", "get", row.Pane)
-	if pane.code != 0 {
+	if !pane.ok() {
 		if pane.herdrError() != "pane_not_found" {
-			return paneRead{kind: "unreadable", detail: pane.detail()}
+			return paneRead{kind: paneUnreadable, detail: pane.detail()}
 		}
 		byName := runTool("herdr", "agent", "get", row.ID)
 		switch {
-		case byName.code == 0:
+		case byName.ok():
 			_, _, moved, err := parseAgent(byName.stdout)
 			if err != nil {
-				return paneRead{kind: "unreadable", detail: printable(err.Error())}
+				return paneRead{kind: paneUnreadable, detail: printable(err.Error())}
 			}
-			return paneRead{kind: "moved", moved: printable(moved)}
+			return paneRead{kind: paneMoved, moved: printable(moved)}
 		case byName.herdrError() == "agent_not_found":
-			return paneRead{kind: "gone"}
+			return paneRead{kind: paneGone}
 		}
-		return paneRead{kind: "unreadable", detail: byName.detail()}
+		return paneRead{kind: paneUnreadable, detail: byName.detail()}
 	}
 	agent := runTool("herdr", "agent", "get", row.Pane)
 	switch {
-	case agent.code == 0:
+	case agent.ok():
 		status, name, _, err := parseAgent(agent.stdout)
 		if err != nil {
-			return paneRead{kind: "unreadable", detail: printable(err.Error())}
+			return paneRead{kind: paneUnreadable, detail: printable(err.Error())}
 		}
 		// herdr can have no name for a worker after a start timeout, so only a
 		// different name counts.
 		if name != "" && name != row.ID {
-			return paneRead{kind: "other", other: printable(name)}
+			return paneRead{kind: paneHasOtherAgent, other: printable(name)}
 		}
-		return paneRead{kind: "agent", status: printable(status)}
+		return paneRead{kind: paneHasWorker, status: printable(status)}
 	case agent.herdrError() == "agent_not_found":
-		return paneRead{kind: "none"}
+		return paneRead{kind: paneHasNoAgent}
 	}
-	return paneRead{kind: "unreadable", detail: agent.detail()}
+	return paneRead{kind: paneUnreadable, detail: agent.detail()}
 }
 
 func parseAgent(text string) (status, name, pane string, err error) {
@@ -196,23 +209,21 @@ func parseAgent(text string) (status, name, pane string, err error) {
 	return body.Result.Agent.Status, body.Result.Agent.Name, body.Result.Agent.Pane, nil
 }
 
-// keepOrRemoveFolder removes the folder only when every check says it holds no
-// work. When crew is not sure, it keeps the folder and says so.
 func keepOrRemoveFolder(row worker, stderr io.Writer) (kept bool, paths int) {
 	if _, err := os.Lstat(row.Folder); errors.Is(err, os.ErrNotExist) {
 		return false, 0
 	}
 	work := folderWork(row)
 	switch {
-	case work.gitFailed != "":
+	case work.gitError != "":
 		fmt.Fprintf(stderr, "crew stop: kept %s and branch %s: git cannot read this folder: %s. The repository may have moved, or its worktree record may be gone. Look in the folder, and delete it yourself when it holds nothing you need\n",
-			printable(row.Folder), printable(row.Branch), work.gitFailed)
+			printable(row.Folder), printable(row.Branch), work.gitError)
 		return true, 0
-	case work.why != "":
-		printKept(row, work.why, stderr)
+	case work.keepReason != "":
+		printKept(row, work.keepReason, stderr)
 		return true, work.paths
 	}
-	if r := runTool("git", "-C", row.Repo, "worktree", "remove", row.Folder); r.code != 0 {
+	if r := runTool("git", "-C", row.Repo, "worktree", "remove", row.Folder); !r.ok() {
 		printKept(row, "git worktree remove failed: "+r.detail(), stderr)
 		return true, 0
 	}
@@ -221,16 +232,14 @@ func keepOrRemoveFolder(row worker, stderr io.Writer) (kept bool, paths int) {
 
 func printKept(row worker, why string, stderr io.Writer) {
 	folder, repo, branch := shellQuote(row.Folder), shellQuote(row.Repo), shellQuote(row.Branch)
-	see := "git " + strings.Join(statusSettings, " ") + " -C " + folder + " " + strings.Join(statusArgs, " ")
+	see := "git " + strings.Join(strictFileCheckSettings, " ") + " -C " + folder + " " + strings.Join(statusArgs, " ")
 	fmt.Fprintf(stderr, "crew stop: kept %s and branch %s: %s. To see it: %s. To delete the folder and all that it holds, with the branch: git -C %s worktree remove --force %s && git -C %s branch -D %s\n",
 		printable(row.Folder), printable(row.Branch), why, see, repo, folder, repo, branch)
 }
 
-// statusSettings make git compare file contents, whatever the local settings
-// say, so a file monitor or a loose file-time check cannot hide an edit.
 var (
-	statusSettings = []string{"-c", "core.fsmonitor=false", "-c", "core.checkStat=default", "-c", "core.trustctime=true"}
-	statusArgs     = []string{"status", "--porcelain", "--ignored", "--untracked-files=normal", "--ignore-submodules=none"}
+	strictFileCheckSettings = []string{"-c", "core.fsmonitor=false", "-c", "core.checkStat=default", "-c", "core.trustctime=true"}
+	statusArgs              = []string{"status", "--porcelain", "--ignored", "--untracked-files=normal", "--ignore-submodules=none"}
 )
 
 // inProgress names what a stopped git operation leaves in a worktree's git
@@ -238,49 +247,48 @@ var (
 var inProgress = []string{"rebase-apply", "rebase-merge", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG", "sequencer"}
 
 type folderState struct {
-	paths     int
-	why       string // why the folder may hold work
-	gitFailed string // what git said when it could not read the folder
+	paths      int
+	keepReason string
+	gitError   string
 }
 
-// folderWork says why the folder may hold work, or nothing when it is clean. The
-// checks do not rest on one view: git worktree remove deletes ignored files, and
+// The checks do not rest on one view: git worktree remove deletes ignored files, and
 // git settings can hide files from git status and from that command's own check.
 func folderWork(row worker) folderState {
 	// symbolic-ref exits 1 with no message on a detached HEAD.
 	head := runTool("git", "-C", row.Folder, "symbolic-ref", "-q", "HEAD")
-	if head.code != 0 && (head.code != 1 || head.stderr != "") {
-		return folderState{gitFailed: head.detail()}
+	if !head.ok() && (!head.exited(1) || head.stderr != "") {
+		return folderState{gitError: head.detail()}
 	}
 	if strings.TrimSpace(head.stdout) != "refs/heads/"+row.Branch {
-		return folderState{why: "its HEAD is not on that branch, so a commit may exist only there"}
+		return folderState{keepReason: "its HEAD is not on that branch, so a commit may exist only there"}
 	}
 	gitDir := runTool("git", "-C", row.Folder, "rev-parse", "--absolute-git-dir")
-	if gitDir.code != 0 {
-		return folderState{gitFailed: gitDir.detail()}
+	if !gitDir.ok() {
+		return folderState{gitError: gitDir.detail()}
 	}
 	for _, name := range inProgress {
 		if _, err := os.Lstat(filepath.Join(strings.TrimSpace(gitDir.stdout), name)); !errors.Is(err, os.ErrNotExist) {
-			return folderState{why: "a git operation is in progress there, and its saved state (" + name + ") would be lost"}
+			return folderState{keepReason: "a git operation is in progress there, and its saved state (" + name + ") would be lost"}
 		}
 	}
-	args := append(append([]string{}, statusSettings...), "-C", row.Folder)
+	args := append(append([]string{}, strictFileCheckSettings...), "-C", row.Folder)
 	status := runTool("git", append(args, statusArgs...)...)
-	if status.code != 0 {
-		return folderState{gitFailed: status.detail()}
+	if !status.ok() {
+		return folderState{gitError: status.detail()}
 	}
 	// With no exclude rule, this lists every untracked and ignored file.
 	others := runTool("git", "-C", row.Folder, "ls-files", "--others")
-	if others.code != 0 {
-		return folderState{gitFailed: others.detail()}
+	if !others.ok() {
+		return folderState{gitError: others.detail()}
 	}
 	flags := runTool("git", "-C", row.Folder, "ls-files", "-v", "-z")
-	if flags.code != 0 {
-		return folderState{gitFailed: flags.detail()}
+	if !flags.ok() {
+		return folderState{gitError: flags.detail()}
 	}
 	stages := runTool("git", "-C", row.Folder, "ls-files", "-s", "-z")
-	if stages.code != 0 {
-		return folderState{gitFailed: stages.detail()}
+	if !stages.ok() {
+		return folderState{gitError: stages.detail()}
 	}
 	paths := countLines(status.stdout)
 	if paths == 0 {
@@ -290,16 +298,16 @@ func folderWork(row worker) folderState {
 	switch paths {
 	case 0:
 	case 1:
-		return folderState{paths: 1, why: "1 path holds work"}
+		return folderState{paths: 1, keepReason: "1 path holds work"}
 	default:
-		return folderState{paths: paths, why: fmt.Sprintf("%d paths hold work", paths)}
+		return folderState{paths: paths, keepReason: fmt.Sprintf("%d paths hold work", paths)}
 	}
 	nested, err := nestedGit(row.Folder)
 	switch {
 	case err != nil:
-		return folderState{why: "crew could not read all of it: " + printable(err.Error())}
+		return folderState{keepReason: "crew could not read all of it: " + printable(err.Error())}
 	case nested != "":
-		return folderState{why: "git does not look inside " + printable(nested) + ", so a file there may be work"}
+		return folderState{keepReason: "git does not look inside " + printable(nested) + ", so a file there may be work"}
 	}
 	return folderState{}
 }
@@ -328,8 +336,7 @@ func hiddenFiles(folder, listing string) int {
 // filledSubmodules counts the submodule folders that hold files but were never
 // initialized. git treats such a folder as the submodule's place and does not
 // look inside, so git status and git ls-files list nothing there. In git ls-files
-// -s, mode 160000 is a submodule. A folder with a .git entry goes through the
-// other checks, and an empty one holds nothing.
+// -s, mode 160000 is a submodule.
 func filledSubmodules(folder, listing string) int {
 	n := 0
 	for entry := range strings.SplitSeq(listing, "\x00") {
@@ -381,14 +388,12 @@ func countLines(text string) int {
 	return strings.Count(text, "\n") + 1
 }
 
-// keepOrDeleteBranch uses only git branch -d, which refuses unmerged work. It
-// compares with the checkout's HEAD, so a moved HEAD keeps the branch too.
 func keepOrDeleteBranch(row worker, stderr io.Writer) (kept bool) {
-	if runTool("git", "-C", row.Repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+row.Branch).code != 0 {
+	if !runTool("git", "-C", row.Repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+row.Branch).ok() {
 		return false
 	}
 	r := runTool("git", "-C", row.Repo, "branch", "-q", "-d", row.Branch)
-	if r.code == 0 {
+	if r.ok() {
 		return false
 	}
 	repo, branch := shellQuote(row.Repo), shellQuote(row.Branch)

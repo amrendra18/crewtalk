@@ -13,20 +13,34 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
+
+	"github.com/amrendra18/crewtalk/internal/message"
 )
+
+const toolWait = 2 * time.Minute
+
+type toolEnd int
 
 const (
-	toolWait   = 2 * time.Minute
-	noticeWait = 2 * time.Second
+	toolExited toolEnd = iota
+	toolNeverRan
+	toolInterrupted
 )
 
-// toolResult holds the outcome of one child process. code is -1 when the
-// process did not run or a signal ended it, and notRun says it never started.
 type toolResult struct {
-	stdout string
-	stderr string
-	code   int
-	notRun bool
+	stdout   string
+	stderr   string
+	end      toolEnd
+	exitCode int
+}
+
+func (r toolResult) exited(code int) bool {
+	return r.end == toolExited && r.exitCode == code
+}
+
+func (r toolResult) ok() bool {
+	return r.exited(0)
 }
 
 // gitLocationVariables are the settings that point git at another repository,
@@ -62,14 +76,19 @@ func runToolFor(ctx context.Context, wait time.Duration, name string, args ...st
 		cmd.Env = gitEnv()
 	}
 	err := cmd.Run()
-	r := toolResult{stdout: stdout.String(), stderr: stderr.String(), notRun: cmd.ProcessState == nil}
+	r := toolResult{stdout: stdout.String(), stderr: stderr.String()}
 	var exit *exec.ExitError
 	switch {
 	case err == nil:
+	case errors.As(err, &exit) && exit.Exited():
+		r.exitCode = exit.ExitCode()
 	case errors.As(err, &exit):
-		r.code = exit.ExitCode()
+		r.end = toolInterrupted
 	default:
-		r.code = -1
+		r.end = toolInterrupted
+		if cmd.ProcessState == nil {
+			r.end = toolNeverRan
+		}
 		if r.stderr == "" {
 			r.stderr = err.Error()
 		}
@@ -77,13 +96,12 @@ func runToolFor(ctx context.Context, wait time.Duration, name string, args ...st
 	return r
 }
 
-// herdrError is the code in a herdr error object, or empty.
 func (r toolResult) herdrError() string {
 	code, _ := r.parseError()
 	return code
 }
 
-func (r toolResult) parseError() (code, message string) {
+func (r toolResult) parseError() (code, errorText string) {
 	for _, text := range []string{r.stderr, r.stdout} {
 		var body struct {
 			Error struct {
@@ -98,10 +116,9 @@ func (r toolResult) parseError() (code, message string) {
 	return "", ""
 }
 
-// detail is one short printable line that says what the tool reported.
 func (r toolResult) detail() string {
-	if code, message := r.parseError(); code != "" {
-		return printable(code + ": " + message)
+	if code, errorText := r.parseError(); code != "" {
+		return printable(code + ": " + errorText)
 	}
 	for _, text := range []string{r.stderr, r.stdout} {
 		for line := range strings.SplitSeq(text, "\n") {
@@ -110,65 +127,52 @@ func (r toolResult) detail() string {
 			}
 		}
 	}
-	return "no output, exit code " + strconv.Itoa(r.code)
+	if r.end != toolExited {
+		return "no output, and no exit code"
+	}
+	return "no output, exit code " + strconv.Itoa(r.exitCode)
 }
 
-// printable keeps a tool's text from carrying terminal controls or extra lines
-// into crew's own output.
 func printable(s string) string {
 	const limit = 400
-	out := strings.TrimSpace(noControls(s))
-	if len(out) > limit {
-		out = strings.ToValidUTF8(out[:limit], "") + "..."
+	s = strings.TrimSpace(oneLine(s))
+	if len(s) <= limit {
+		return message.Printable(s)
 	}
-	return out
-}
-
-func noControls(s string) string {
-	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
-			return ' '
+	end := limit
+	for i := limit; i > limit-utf8.UTFMax; i-- {
+		if utf8.RuneStart(s[i]) {
+			end = i
+			break
 		}
-		return r
-	}, s)
+	}
+	return message.Printable(s[:end]) + "..."
 }
 
-var shellSafe = regexp.MustCompile(`^[A-Za-z0-9_@%+=:,./-]+$`)
+func oneLine(s string) string {
+	return strings.NewReplacer("\n", " ", "\t", " ").Replace(s)
+}
 
-// shellQuote makes a value safe to paste into a printed command, because a lead
-// may run the line as it stands.
+var shellSafe = regexp.MustCompile(`^[A-Za-z0-9_@%+:,./-][A-Za-z0-9_@%+=:,./-]*$`)
+
 func shellQuote(s string) string {
-	s = noControls(s)
+	s = message.Printable(oneLine(s))
 	if shellSafe.MatchString(s) {
 		return s
 	}
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// notify raises a herdr notice inside herdr. A notice never fails a command.
-func notify(title, body string) {
-	if os.Getenv("HERDR_ENV") != "1" {
-		return
-	}
-	path, err := exec.LookPath("herdr")
-	if err != nil {
-		return
-	}
-	runToolFor(context.Background(), noticeWait, path, "notification", "show", title, "--body", body)
-}
-
-// listeners finds crewtalk wait processes for these names. crew only reports
-// them, because it cannot tell its own from a person's by anything but the name.
 func listeners(names ...string) ([]string, error) {
 	quoted := make([]string, len(names))
 	for i, name := range names {
 		quoted[i] = regexp.QuoteMeta(name)
 	}
 	r := runTool("pgrep", "-fl", "crewtalk wait --as ("+strings.Join(quoted, "|")+")( |$)")
-	switch r.code {
-	case 0:
+	switch {
+	case r.ok():
 		return strings.Split(strings.TrimSpace(r.stdout), "\n"), nil
-	case 1:
+	case r.exited(1):
 		return nil, nil
 	}
 	return nil, errors.New(r.detail())

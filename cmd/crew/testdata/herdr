@@ -1,6 +1,14 @@
 #!/bin/sh
-# Stands in for herdr in crew's tests. It keeps panes in FAKE_HERDR_STATE, records
-# each call there, and refuses every command outside crew's allowed list.
+allowed='tab create
+agent start
+agent get
+pane get
+pane close
+notification show'
+if [ "${1:-}" = --allowed ]; then
+	printf '%s\n' "$allowed"
+	exit 0
+fi
 state=${FAKE_HERDR_STATE:?FAKE_HERDR_STATE is not set}
 mkdir -p "$state/panes" "$state/names"
 printf '%s\0' "$@" >>"$state/calls"
@@ -12,14 +20,10 @@ fail() {
 }
 
 command="$1 $2"
-case $command in
-"tab create" | "tab close" | "pane get" | "pane read" | "pane close" | "pane layout" | \
-	"agent start" | "agent get" | "agent list" | "notification show") ;;
-*)
+if ! printf '%s\n' "$allowed" | grep -qxF "$command"; then
 	printf 'fake herdr: %s is not on the allowed list\n' "$command" >&2
 	exit 99
-	;;
-esac
+fi
 if [ "$command" = "${FAKE_HERDR_DENY:-}" ]; then
 	printf 'fake herdr: %s is taken off the allowed list\n' "$command" >&2
 	exit 99

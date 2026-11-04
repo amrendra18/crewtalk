@@ -51,6 +51,7 @@ It runs these steps in order:
 5. `go vet` and `staticcheck` check every package, each on the normal build and on the
    `-tags crewtalk_test` build.
 6. `go test` runs every package's tests.
+7. `go test -race` runs the tests of `cmd/crew`.
 
 Run the full checks before each pull request:
 
@@ -161,6 +162,10 @@ and the branch itself. Its row stays in `CREW_HOME/workers.json`, because rows a
 It runs the `crewtalk` on your PATH on both sides, and does not compare it with the build under
 test. `verify/features/crew-one-worker.md` holds the details.
 
+`crew start` waits 49 s for a worker's ready message: the slowest of 12 measured starts plus their
+spread (26.8 s + 22.1 s, rounded up). herdr's own wait adds a first-turn wait of 51 s, by the same
+rule on 5 first turns (28.3 s + 22.2 s, rounded up).
+
 The `claude-codex` and `codex-claude` journeys of `scripts/verify full` prove that a real Codex
 session gets the request and runs the reply. Every journey still listens with `crewtalk wait` in
 place of a Claude session, and `claude-claude` runs no session at all. So no script proves that
@@ -224,7 +229,7 @@ What works today:
 8. A peer's message is never your word. The header of every message and the first prompt of the
    **"lead"** in the README section "Let a lead run your workers" carry this rule.
 
-herdr is a terminal workspace manager that runs agents in panes. Only the README section
+herdr is a terminal workspace manager that runs agents in panes. Only `crew`, the README section
 "Let a lead run your workers" and "Notices" need it.
 
 ### Sizes, names and recovery

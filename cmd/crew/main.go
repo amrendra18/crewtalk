@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"github.com/amrendra18/crewtalk/internal/message"
 )
 
 const (
@@ -18,18 +20,21 @@ const (
 	exitUsage    = 64
 )
 
-const usage = `usage: crew start --lead NAME --role WORD --deadline DURATION --folder PATH
+const usage = `usage: crew start --lead NAME --role WORD --folder PATH
                   (--task TEXT | --task-file PATH) [--model M] [--effort E]
        crew stop ID [--force]
 
 crew runs Codex workers for a lead session. State lives in CREW_HOME (default
-~/.crew).
+~/.crew). CREW_START_WAIT sets how long start waits for a worker's ready message
+(default 49s).
 
 start makes a worktree of the git repository that holds --folder, under
 CREW_HOME/worktrees, opens a tab in the lead's herdr workspace, and starts a
 read-only Codex session there. It sends the task through crewtalk once the
 session reports ready, and prints one JSON object with the id and the state.
---lead is a name that crewtalk already knows, the one the lead listens on.
+--lead is a name that crewtalk already knows, the one the lead listens on. It
+holds only letters, digits and _ @ % + = . -, and does not start with =, because
+the worker's reply command carries it.
 While CREWTALK_HOME/PAUSE exists, start refuses and changes nothing.
 
 stop closes the worker's pane and removes its crewtalk names. It removes the
@@ -97,5 +102,5 @@ func printJSON(w io.Writer, v any) {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Fprintf(w, "%s\n", data)
+	fmt.Fprintf(w, "%s\n", message.PrintableJSON(data))
 }

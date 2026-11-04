@@ -4,13 +4,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 )
 
-// sparseFixture makes a repository whose new worktrees leave out outside/b.txt.
 func sparseFixture(t *testing.T) *fixture {
 	t.Helper()
 	f := newFixture(t)
@@ -250,8 +250,6 @@ func TestStopKeepsFolderWhenGitFails(t *testing.T) {
 	}
 }
 
-// addSubmodule commits a submodule at sub, so a new worktree holds an empty sub
-// folder until someone initializes it.
 func (f *fixture) addSubmodule() {
 	f.t.Helper()
 	source := filepath.Join(filepath.Dir(f.repo), "source")
@@ -333,15 +331,168 @@ func TestStartRefusesATaskFromALongPipe(t *testing.T) {
 		defer w.Close()
 		w.Write([]byte(strings.Repeat("x", 3_000_000)))
 	}()
-	r := crew(t, "start", "--lead", "lead", "--role", "review", "--deadline", "10m", "--folder", f.repo, "--task-file", pipe)
+	r := crew(t, "start", "--lead", "lead", "--role", "review", "--folder", f.repo, "--task-file", pipe)
 	if r.code != exitUsage {
 		t.Fatalf("exit %d, want %d; stderr %q", r.code, exitUsage, r.stderr[:min(len(r.stderr), 200)])
 	}
 	if f.herdrCalls() != nil {
 		t.Fatalf("herdr was called: %q", f.herdrCalls())
 	}
-	r = crew(t, "start", "--lead", "lead", "--role", "review", "--deadline", "10m", "--folder", f.repo, "--task-file", "/dev/zero")
+	r = crew(t, "start", "--lead", "lead", "--role", "review", "--folder", f.repo, "--task-file", "/dev/zero")
 	if r.code != exitUsage {
 		t.Fatalf("/dev/zero: exit %d, want %d; stderr %q", r.code, exitUsage, r.stderr[:min(len(r.stderr), 200)])
+	}
+}
+
+func (f *fixture) refuseCrewtalk(when, words string) {
+	f.t.Helper()
+	script := "#!/bin/sh\ncase \" $* \" in\n*\" " + when + " \"*) echo '" + words + "' >&2; exit 3 ;;\nesac\nexec " + crewtalkBin + " \"$@\"\n"
+	path := filepath.Join(f.binDir, "crewtalk")
+	if err := os.Remove(path); err != nil {
+		f.t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func TestStartExits3WhenCrewtalkRefusesAStep(t *testing.T) {
+	for _, tc := range []struct {
+		name, when, note, state string
+	}{
+		{"the ready wait", "wait --as", "no-ready", "starting"},
+		{"the task send", "send --from lead", "task-not-sent", "starting"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.refuseCrewtalk(tc.when, "refused by a limit")
+			r := f.start()
+			if r.code != exitRefused {
+				t.Fatalf("exit %d, want %d; stderr %q", r.code, exitRefused, r.stderr)
+			}
+			row := f.onlyRow()
+			if row.State != tc.state || !slices.Contains(row.Notes, tc.note) {
+				t.Fatalf("row %+v, want %s with the note %s", row, tc.state, tc.note)
+			}
+			if want := "crew stop " + row.ID + " --force"; !strings.Contains(r.stderr, want) || !strings.Contains(r.stderr, "refused by a limit") {
+				t.Fatalf("stderr %q does not give the reason and %q", r.stderr, want)
+			}
+		})
+	}
+}
+
+func TestStopForceNoticeSaysWhenNoPaneWasOpen(t *testing.T) {
+	notice := func(f *fixture) string {
+		for _, call := range f.herdrCalls() {
+			if len(call) > 1 && call[0] == "notification" {
+				return strings.Join(call, " ")
+			}
+		}
+		return ""
+	}
+	t.Run("the start failed before the tab", func(t *testing.T) {
+		f := newFixture(t)
+		t.Setenv("FAKE_HERDR_DENY", "tab create")
+		r := f.start()
+		if r.code != exitFailed {
+			t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
+		}
+		row := f.onlyRow()
+		if r := crew(t, "stop", row.ID, "--force"); r.code != exitOK {
+			t.Fatalf("stop exit %d, stderr %q", r.code, r.stderr)
+		}
+		if got := notice(f); !strings.Contains(got, "no open pane") || strings.Contains(got, "closed pane") {
+			t.Fatalf("notice %q", got)
+		}
+	})
+	t.Run("the pane was closed by hand", func(t *testing.T) {
+		f := newFixture(t)
+		id, _ := f.mustStart()
+		row := f.row(id)
+		if err := os.Remove(filepath.Join(f.herdr, "panes", row.Pane)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(f.herdr, "names", id)); err != nil {
+			t.Fatal(err)
+		}
+		if r := crew(t, "stop", id, "--force"); r.code != exitOK {
+			t.Fatalf("stop exit %d, stderr %q", r.code, r.stderr)
+		}
+		if got := notice(f); !strings.Contains(got, "no open pane") || strings.Contains(got, "closed pane") {
+			t.Fatalf("notice %q", got)
+		}
+	})
+	t.Run("the pane was open", func(t *testing.T) {
+		f := newFixture(t)
+		id, _ := f.mustStart()
+		pane := f.row(id).Pane
+		if r := crew(t, "stop", id, "--force"); r.code != exitOK {
+			t.Fatalf("stop exit %d, stderr %q", r.code, r.stderr)
+		}
+		if got := notice(f); !strings.Contains(got, "closed pane "+pane) {
+			t.Fatalf("notice %q", got)
+		}
+	})
+}
+
+func TestStopForceNoticeOnlyAfterTheClose(t *testing.T) {
+	f := newFixture(t)
+	id, _ := f.mustStart()
+	t.Setenv("FAKE_HERDR_DENY", "pane close")
+	r := crew(t, "stop", id, "--force")
+	if r.code != exitFailed {
+		t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
+	}
+	if got := f.countCalls("notification", "show"); got != 0 {
+		t.Fatalf("notices %d after a failed close, want 0", got)
+	}
+}
+
+func TestStartAcceptsNamesTheReplyCommandCanCarry(t *testing.T) {
+	for _, lead := range []string{"lead@1", "lead+a", "-lead", "lead=1", "a%b", "a.b_c"} {
+		t.Run(lead, func(t *testing.T) {
+			f := newFixture(t)
+			f.tool("crewtalk", "join", "--as="+lead, "--kind", "claude")
+			r := crew(t, "start", "--lead="+lead, "--role", "review", "--folder", f.repo, "--task", "x")
+			if r.code != exitOK {
+				t.Fatalf("exit %d, stderr %q", r.code, r.stderr)
+			}
+			data, err := os.ReadFile(f.codexArgs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := "crewtalk send --to " + lead + " --reply-to MESSAGE_ID"; !strings.Contains(string(data), want) {
+				t.Fatalf("the task message %q does not hold %q", data, want)
+			}
+		})
+	}
+}
+
+func TestStartRefusesANameTheReplyCommandCannotCarry(t *testing.T) {
+	for _, lead := range []string{"lead$x", "it's", `a\b`, "$(touch${IFS}PWNED)", "`touch${IFS}PWNED`", "a*b", "a\"b", "=lead"} {
+		t.Run(lead, func(t *testing.T) {
+			f := newFixture(t)
+			f.tool("crewtalk", "join", "--as="+lead, "--kind", "claude")
+			r := crew(t, "start", "--lead="+lead, "--role", "review", "--folder", f.repo, "--task", "x")
+			if r.code != exitUsage || !strings.Contains(r.stderr, "reply command") {
+				t.Fatalf("exit %d, stderr %q; want %d and a reason that names the reply command", r.code, r.stderr, exitUsage)
+			}
+			if f.herdrCalls() != nil {
+				t.Fatalf("herdr was called: %q", f.herdrCalls())
+			}
+			if reason, _, _ := strings.Cut(r.stderr, "\n"); strings.Contains(reason, lead) {
+				t.Fatalf("the printed line %q holds the lead's name", reason)
+			}
+		})
+	}
+}
+
+func TestStartRefusesANameCrewtalkRefuses(t *testing.T) {
+	f := newFixture(t)
+	for _, lead := range []string{"a b", "a/b", "a:b", "a,b", "a;b"} {
+		r := crew(t, "start", "--lead", lead, "--role", "review", "--folder", f.repo, "--task", "x")
+		if r.code != exitUsage {
+			t.Fatalf("--lead %q: exit %d, want %d; stderr %q", lead, r.code, exitUsage, r.stderr)
+		}
 	}
 }

@@ -9,7 +9,8 @@ usage: scripts/check fast|full
          heading in verify/hand-journey.md;
          verify/features/ holds one file per scripts/verify journey;
          shellcheck on every shell script; go vet and staticcheck, each on
-         the normal and the -tags crewtalk_test build; go test ./...
+         the normal and the -tags crewtalk_test build; go test ./...; go test
+         -race ./cmd/crew
   full   fast, then one scripts/verify fast run with the fake codex
          internal/route/codex/testdata/codex in reply mode (a test input), a
          temporary CREWTALK_HOME under /tmp and two fixed fake thread ids;
@@ -138,6 +139,7 @@ run_fast() {
   staticcheck ./... || fail "staticcheck"
   staticcheck -tags crewtalk_test ./... || fail "staticcheck -tags crewtalk_test"
   go test ./... || fail "go test"
+  go test -race ./cmd/crew || fail "go test -race ./cmd/crew"
 }
 
 listener_left() {

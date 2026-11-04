@@ -30,7 +30,6 @@ type worker struct {
 	Effort     string   `json:"effort"`
 	Address    string   `json:"address"`
 	ReadyName  string   `json:"ready_name"`
-	Tab        string   `json:"tab"`
 	Pane       string   `json:"pane"`
 	Repo       string   `json:"repo"`
 	Folder     string   `json:"folder"`
@@ -38,10 +37,8 @@ type worker struct {
 	Base       string   `json:"base"`
 	TaskFile   string   `json:"task_file"`
 	TaskID     string   `json:"task_id"`
-	Deadline   string   `json:"deadline"`
 	State      string   `json:"state"`
 	StateSince string   `json:"state_since"`
-	IdleSince  string   `json:"idle_since"`
 	ForcedAt   string   `json:"forced_at,omitempty"`
 	FolderKept bool     `json:"folder_kept"`
 	Notes      []string `json:"notes"`
@@ -69,8 +66,6 @@ func now() string {
 	return time.Now().UTC().Format(time.RFC3339)
 }
 
-// crewHomePath returns the absolute path of the state folder. Rows keep paths
-// from it, and a later command can run from another folder.
 func crewHomePath() (string, error) {
 	home := os.Getenv("CREW_HOME")
 	if home == "" {
@@ -83,7 +78,6 @@ func crewHomePath() (string, error) {
 	return filepath.Abs(home)
 }
 
-// makeCrewHome returns the state folder, and creates it and its parts when missing.
 func makeCrewHome() (string, error) {
 	home, err := crewHomePath()
 	if err != nil {
@@ -115,8 +109,6 @@ func readFile(path string) (workerFile, error) {
 	return file, nil
 }
 
-// changeWorkers rewrites the workers file under its lock. A change that returns
-// an error writes nothing.
 func changeWorkers(home string, change func(*workerFile) error) error {
 	path := filepath.Join(home, "workers.json")
 	unlock, err := state.Lock(context.Background(), path+".lock", lockWait)
@@ -138,8 +130,6 @@ func changeWorkers(home string, change func(*workerFile) error) error {
 	return state.Replace(path, append(data, '\n'))
 }
 
-// addWorker gives the row a new id and saves it. Ids are never reused, and rows
-// are never deleted, so a used id stays taken.
 func addWorker(home string, row *worker) error {
 	return changeWorkers(home, func(file *workerFile) error {
 		for range idTries {
@@ -173,8 +163,7 @@ var newSuffix = func() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// saveWorker changes one saved row and updates row to match it.
-func saveWorker(home string, row *worker, change func(*worker)) error {
+func applyToRow(home string, row *worker, change func(*worker)) error {
 	return changeWorkers(home, func(file *workerFile) error {
 		for i := range file.Workers {
 			if file.Workers[i].ID == row.ID {

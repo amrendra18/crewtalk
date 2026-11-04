@@ -9,9 +9,9 @@ usage() {
   cat <<EOF
 usage: scripts/verify fast|full [--feature NAME]
 
-Proves crewtalk delivery between agent sessions, and crew's round with a worker. verify/features/ maps each
-journey to its use case. In every journey, crewtalk wait processes stand in
-for Claude sessions.
+Proves crewtalk delivery between agent sessions, and crew's round with a
+worker. verify/features/ maps each journey to its use case. In every journey,
+crewtalk wait processes stand in for Claude sessions.
   claude-claude  two crewtalk wait processes exchange one message each way
                  through crewtalk send, with no Codex or Claude session, in a
                  temporary CREWTALK_HOME
@@ -107,9 +107,9 @@ Settings:
 
 Exit codes: 0 every selected journey proven (in fast without --feature, a
 skipped journey also counts, and fast --feature codex-rule reports codex-rule
-skipped and exits 0, and so does fast --feature crew-one-worker), 1 a journey failed or was not proven, 3 a
-needed tool is missing or the crewtalk on PATH is not the build under test,
-and nothing was sent, 64 usage error.
+skipped and exits 0, and so does fast --feature crew-one-worker), 1 a journey
+failed or was not proven, 3 a needed tool is missing or the crewtalk on PATH is
+not the build under test, and nothing was sent, 64 usage error.
 
 Each run writes .local/verify/<UTC time>/ with summary.json, summary.md and
 logs/. The summary names the commit (git rev-parse HEAD), whether a file
@@ -693,9 +693,6 @@ $reply_cmd"
   fi
 }
 
-# A round with crew. The fake journeys run a crewtalk built with the test tag, a
-# fake herdr and a fake worker, all first on PATH, in folders under the run's
-# temporary folder.
 fake_thread=11111111-2222-4333-8444-555555555555
 
 in_fake() {
@@ -728,7 +725,7 @@ crew_listener_left() { pgrep -f "crewtalk wait --as ($1|crew-ready-${1##*-})( |\
 
 crew_fake_start() {
   local journey=$1 at=$2 lead=$3 code started
-  crew_out=$(in_fake "$at" crew start --lead "$lead" --role review --deadline 10m --folder "$at/repo" \
+  crew_out=$(in_fake "$at" crew start --lead "$lead" --role review --folder "$at/repo" \
     --task "Read the plan." 2>"$logs/$journey-start.err")
   code=$?
   started=$(line_count "$at/herdr/started")
@@ -842,14 +839,12 @@ crew_dirty_stop() {
   record crew-dirty-stop proven "the pane closed and the name went; 0 of 3 files lost, and the folder and the branch stayed"
 }
 
-# The real round. It runs the crewtalk on PATH on both sides, because that is the
-# one the real worker runs, and it leaves crewtalk itself out of the test.
-crew_real() { PATH=$real_path "$build/crew" "$@"; }
+run_real_crew() { PATH=$real_path "$build/crew" "$@"; }
 
-crew_real_cleanup() {
+stop_open_real_worker() {
   [ -n "$crew_open" ] || return 0
   rm -f "${crew_open_folder:?}/verify-keep.txt"
-  crew_real stop "$crew_open" --force >>"$logs/crew-one-worker.log" 2>&1
+  run_real_crew stop "$crew_open" --force >>"$logs/crew-one-worker.log" 2>&1
   echo "cleanup of $crew_open: crew stop --force exit $?" >>"$logs/crew-one-worker.log"
   crew_open=
 }
@@ -861,7 +856,7 @@ crew_one_worker() {
   listen "$lead" "$home" "$logs/crew-one-worker-lead.txt" "$logs/crew-one-worker-lead.err" || { record crew-one-worker failed "$why"; return; }
   pid=$waiter
   marker=$(new_marker)
-  out=$(crew_real start --lead "$lead" --role verify --deadline 15m --folder "$PWD" \
+  out=$(run_real_crew start --lead "$lead" --role verify --folder "$PWD" \
     --model "$CREW_VERIFY_MODEL" --effort "${CREW_VERIFY_EFFORT:-medium}" \
     --task "This is a harness check from scripts/verify. Run no command except the reply. Your result is the word $marker" \
     2>"$logs/crew-one-worker-start.err")
@@ -888,7 +883,7 @@ crew_one_worker() {
     *) record crew-one-worker failed "the reply does not carry thread $task_id, turn 2 and reply-to $task_id: $header"; return ;;
   esac
   printf 'keep\n' >"$crew_open_folder/verify-keep.txt"
-  until out=$(crew_real stop "$crew_id" 2>"$logs/crew-one-worker-stop.err"); do
+  until out=$(run_real_crew stop "$crew_id" 2>"$logs/crew-one-worker-stop.err"); do
     code=$?
     if [ "$code" -ne 5 ] || [ $((tries += 1)) -gt 30 ]; then
       record crew-one-worker failed "crew stop exited $code: $(first_line "$logs/crew-one-worker-stop.err")"
@@ -998,7 +993,7 @@ fi
 
 build=$(mktemp -d /tmp/crewtalk-verify.XXXXXX) || exit 3
 real_path=$PATH
-trap 'crew_real_cleanup
+trap 'stop_open_real_worker
 [ -z "${waiters// /}" ] || { kill $waiters; wait $waiters; } 2>/dev/null
 while IFS= read -r entry; do
   [ -z "$entry" ] || CREWTALK_HOME=${entry%/*} "$bin" leave --as "${entry##*/}" >>"$logs/leave.log" 2>&1
@@ -1047,7 +1042,7 @@ for j in $selected; do
     crew-one-worker)
       if [ -n "$crew_live" ]; then
         crew_one_worker
-        crew_real_cleanup
+        stop_open_real_worker
       fi
       ;;
   esac
