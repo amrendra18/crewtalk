@@ -9,7 +9,8 @@ usage: scripts/check fast|full
          heading in verify/hand-journey.md;
          verify/features/ holds one file per scripts/verify journey;
          shellcheck on every shell script; go vet and staticcheck, each on
-         the normal and the -tags crewtalk_test build; go test ./...
+         the normal and the -tags crewtalk_test build; go test ./...; go test
+         -race ./cmd/crew
   full   fast, then one scripts/verify fast run with the fake codex
          internal/route/codex/testdata/codex in reply mode (a test input), a
          temporary CREWTALK_HOME under /tmp and two fixed fake thread ids;
@@ -26,7 +27,13 @@ usage: scripts/check fast|full
          send must get codex-rule proven. One that answers with no decision,
          then one that answers allow, must make codex-rule fail, and so must
          one that allows PATH=/x crewtalk send, and one that allows
-         CREWTALK_HOME=/x crewtalk send.
+         CREWTALK_HOME=/x crewtalk send. crew-one-worker must be reported
+         skipped, and scripts/verify full without CREW_VERIFY_MODEL must skip it
+         and exit 1. crew-fake-round must fail with a fake worker that never
+         sends ready, one that never replies, a fake herdr that answers every
+         agent start with agent_pane_busy (and no agent may start), and a fake
+         herdr with pane close taken off its list. crew-dirty-stop must fail
+         with a stand-in git that reports a clean status and removes the folder.
          After the runs, the address book must hold no verify- name. After
          every run, no crewtalk wait that the run started may still be
          running. A codex, a claude and a herdr that refuse to run come first
@@ -132,6 +139,7 @@ run_fast() {
   staticcheck ./... || fail "staticcheck"
   staticcheck -tags crewtalk_test ./... || fail "staticcheck -tags crewtalk_test"
   go test ./... || fail "go test"
+  go test -race ./cmd/crew || fail "go test -race ./cmd/crew"
 }
 
 listener_left() {
@@ -194,9 +202,11 @@ STUB
   FAKE_CODEX_MODE=reply scripts/verify fast >"$home/reply.out" 2>&1 || failed+=" journeys"
   cat "$home/reply.out"
   for j in $(journey_names); do
-    [ "$j" = codex-rule ] || grep -q "^$j: proven" "$home/reply.out" || failed+=" $j-not-proven"
+    case $j in
+      codex-rule | crew-one-worker) grep -q "^$j: skipped" "$home/reply.out" || failed+=" $j-not-skipped" ;;
+      *) grep -q "^$j: proven" "$home/reply.out" || failed+=" $j-not-proven" ;;
+    esac
   done
-  grep -q '^codex-rule: skipped' "$home/reply.out" || failed+=" codex-rule-not-skipped"
   echo "check: test input: the same fake in its unknown-thread mode"
   FAKE_CODEX_MODE=unknown must_fail unknown-thread unknown \
     unknown-thread-not-named '^claude-codex: failed' -- \
@@ -221,6 +231,45 @@ STUB
   if [ ! -f "$home/agents.json" ] || grep -qF '"verify-' "$home/agents.json"; then
     failed+=" verify-row-left"
   fi
+  echo "check: test input: a fake worker that never sends ready"
+  FAKE_WORKER_MODE=no-ready CREW_START_WAIT=1s must_fail crew-no-ready crew-no-ready \
+    crew-no-ready-not-named '^crew-fake-round: failed (crew start exited 4' -- \
+    scripts/verify fast --feature crew-fake-round
+  echo "check: test input: a fake worker that never replies"
+  FAKE_WORKER_MODE=no-reply CREWTALK_VERIFY_TIMEOUT=3 must_fail crew-no-reply crew-no-reply \
+    crew-no-reply-not-named '^crew-fake-round: failed (no reply from ' -- \
+    scripts/verify fast --feature crew-fake-round
+  echo "check: test input: a fake herdr that answers every agent start with agent_pane_busy"
+  FAKE_HERDR_START=always-busy CREW_START_WAIT=2s must_fail crew-busy crew-busy \
+    crew-busy-not-named '^crew-fake-round: failed (crew start exited 5, agents started 0: ' -- \
+    scripts/verify fast --feature crew-fake-round
+  echo "check: test input: a fake herdr with pane close taken off its list"
+  FAKE_HERDR_DENY='pane close' must_fail crew-deny crew-deny \
+    crew-deny-not-named '^crew-fake-round: failed (crew stop exited 5: ' -- \
+    scripts/verify fast --feature crew-fake-round
+  echo "check: test input: a stand-in git that reports a clean status and removes the folder"
+  mkdir "$home/lost-git"
+  cat >"$home/lost-git/git" <<STUB
+#!/bin/sh
+case " \$* " in
+*" status --porcelain "* | *" ls-files "*) exit 0 ;;
+*" worktree remove "*)
+	for folder in "\$@"; do :; done
+	rm -rf "\$folder"
+	exec $(command -v git) -C "\$2" worktree prune
+	;;
+esac
+exec $(command -v git) "\$@"
+STUB
+  chmod +x "$home/lost-git/git"
+  PATH=$home/lost-git:$PATH must_fail crew-lost-file crew-lost-file \
+    crew-lost-file-not-named '^crew-dirty-stop: failed (crew stop lost ' -- \
+    scripts/verify fast --feature crew-dirty-stop
+  echo "check: test input: scripts/verify full without CREW_VERIFY_MODEL"
+  code=0
+  env -u CREWTALK_CODEX_BIN -u CREW_VERIFY_MODEL scripts/verify full --feature crew-one-worker >"$home/no-model.out" 2>&1 || code=$?
+  [ "$code" -eq 1 ] || failed+=" no-model-exit-$code"
+  grep -q '^crew-one-worker: skipped' "$home/no-model.out" || failed+=" no-model-not-skipped"
   echo "check: test input: scripts/verify full without the second thread"
   code=0
   env -u CREWTALK_CODEX_BIN -u CREWTALK_VERIFY_CODEX_THREAD_2 scripts/verify full --feature two-projects >"$home/one-thread.out" 2>&1 || code=$?
@@ -248,7 +297,7 @@ STUB
       "$form-rule-not-named" "^codex-rule: failed (.* allows $form crewtalk send" -- \
       env -u CREWTALK_CODEX_BIN scripts/verify full --feature codex-rule
   done
-  for out in reply unknown slow bar silent no-reply-to; do
+  for out in reply unknown slow bar silent no-reply-to crew-no-ready crew-no-reply crew-busy crew-deny crew-lost-file; do
     ! listener_left "$home/$out.out" || failed+=" wait-left-by-$out"
   done
   rm -rf "$home"

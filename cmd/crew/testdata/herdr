@@ -1,0 +1,119 @@
+#!/bin/sh
+allowed='tab create
+agent start
+agent get
+pane get
+pane close
+notification show'
+if [ "${1:-}" = --allowed ]; then
+	printf '%s\n' "$allowed"
+	exit 0
+fi
+state=${FAKE_HERDR_STATE:?FAKE_HERDR_STATE is not set}
+mkdir -p "$state/panes" "$state/names"
+printf '%s\0' "$@" >>"$state/calls"
+printf '\n' >>"$state/calls"
+
+fail() {
+	printf '{"error":{"code":"%s","message":"%s"},"id":"cli:fake"}\n' "$1" "$2" >&2
+	exit 1
+}
+
+command="$1 $2"
+if ! printf '%s\n' "$allowed" | grep -qxF "$command"; then
+	printf 'fake herdr: %s is not on the allowed list\n' "$command" >&2
+	exit 99
+fi
+if [ "$command" = "${FAKE_HERDR_DENY:-}" ]; then
+	printf 'fake herdr: %s is taken off the allowed list\n' "$command" >&2
+	exit 99
+fi
+shift 2
+
+case $command in
+"pane get" | "agent get" | "pane close")
+	if [ "${FAKE_HERDR_BROKEN:-}" = 1 ] || [ "${FAKE_HERDR_BROKEN:-}" = "$command" ]; then
+		fail server_unavailable "the herdr server is not running"
+	fi
+	;;
+esac
+
+next_number() {
+	n=$(($(cat "$state/next" 2>/dev/null || echo 0) + 1))
+	echo "$n" >"$state/next"
+	echo "$n"
+}
+
+start_worker() {
+	echo run >>"$state/started"
+	echo "$name" >"$state/panes/$pane"
+	echo "$pane" >"$state/names/$name"
+	(
+		"${FAKE_WORKER_BIN:?FAKE_WORKER_BIN is not set}" "$prompt"
+		echo finished >>"$state/finished"
+	) </dev/null >>"$state/worker.log" 2>&1 &
+}
+
+case $command in
+"tab create")
+	n=$(next_number)
+	pane=w:p$n
+	: >"$state/panes/$pane"
+	printf '{"id":"cli:tab:create","result":{"root_pane":{"pane_id":"%s","tab_id":"w:t%s"},"tab":{"tab_id":"w:t%s"},"type":"tab_created"}}\n' "$pane" "$n" "$n"
+	;;
+"agent start")
+	name=$1
+	shift
+	while [ "$1" != -- ]; do
+		[ "$1" != --pane ] || pane=$2
+		shift
+	done
+	for prompt in "$@"; do :; done
+	case ${FAKE_HERDR_START:-ok} in
+	ok) start_worker ;;
+	busy:*)
+		tries=$(($(cat "$state/busy" 2>/dev/null || echo 0) + 1))
+		echo "$tries" >"$state/busy"
+		[ "$tries" -gt "${FAKE_HERDR_START#busy:}" ] || fail agent_pane_busy "the pane is busy"
+		start_worker
+		;;
+	always-busy) fail agent_pane_busy "the pane is busy" ;;
+	not-ready)
+		echo "$name" >"$state/panes/$pane"
+		echo "$pane" >"$state/names/$name"
+		fail agent_not_ready "agent $name is blocked during startup"
+		;;
+	timeout)
+		start_worker
+		fail timeout "timed out waiting for agent startup"
+		;;
+	fail) fail agent_start_failed "the agent did not start" ;;
+	esac
+	printf '{"id":"cli:agent:start","result":{"agent":{"name":"%s","pane_id":"%s"}}}\n' "$name" "$pane"
+	;;
+"agent get")
+	if [ -f "$state/names/$1" ]; then
+		pane=$(cat "$state/names/$1")
+		[ -f "$state/panes/$pane" ] || pane=
+	elif [ -s "$state/panes/$1" ]; then
+		pane=$1
+	else
+		pane=
+	fi
+	[ -z "${FAKE_HERDR_MOVED_TO:-}" ] || pane=$FAKE_HERDR_MOVED_TO
+	[ -n "$pane" ] || fail agent_not_found "agent target $1 not found"
+	agent_name=$(cat "$state/panes/$pane" 2>/dev/null)
+	agent_name=${FAKE_HERDR_NAME:-$agent_name}
+	name_field=
+	[ "$agent_name" = none ] || [ -z "$agent_name" ] || name_field="\"name\":\"$agent_name\","
+	printf '{"id":"cli:agent:get","result":{"agent":{"agent_status":"%s",%s"pane_id":"%s"}}}\n' "${FAKE_HERDR_STATUS:-idle}" "$name_field" "$pane"
+	;;
+"pane get")
+	[ -f "$state/panes/$1" ] || fail pane_not_found "pane $1 not found"
+	printf '{"id":"cli:pane:get","result":{"pane":{"pane_id":"%s"}}}\n' "$1"
+	;;
+"pane close")
+	[ -f "$state/panes/$1" ] || fail pane_not_found "pane $1 not found"
+	rm -f "$state/panes/$1"
+	;;
+esac
